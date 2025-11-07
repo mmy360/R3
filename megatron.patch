@@ -1,0 +1,416 @@
+diff --git a/examples/gpt3/train_gpt3_175b_distributed.sh b/examples/gpt3/train_gpt3_175b_distributed.sh
+index 7d2c01b31..49f84005c 100755
+--- a/examples/gpt3/train_gpt3_175b_distributed.sh
++++ b/examples/gpt3/train_gpt3_175b_distributed.sh
+@@ -2,9 +2,83 @@
+ 
+ # Runs the "175B" parameter model
+ 
++MOE_SHARED_EXPERTS=2
++MOE_FFN_HIDDEN=1408
++MOE_SHARED_EXPERT_INTERMEDIATE_SIZE=$(($MOE_FFN_HIDDEN * $MOE_SHARED_EXPERTS))
++MOE_ROUTER_TOPK_SCALING_FACTOR=2.446
++NLAYERS=27
++FIRST_K_DENSE_REPLACE=1
++
++arr=()
++for ((i=0; i<NLAYERS; i++)); do
++  if (( i < FIRST_K_DENSE_REPLACE )); then
++    arr+=(0)
++  else
++    arr+=(1)
++  fi
++done
++
++printf -v MOE_LAYER_FREQ "[%s]" "$(IFS=', '; echo "${arr[*]}")"
++
++# moonlight
++MODEL_ARGS=(
++    --disable-bias-linear
++    --num-layers 3
++    --hidden-size 2048
++    --ffn-hidden-size 11264
++    --num-attention-heads 16
++    --kv-channels 128
++    --normalization RMSNorm
++    --position-embedding-type rope
++    --norm-epsilon 1e-5
++    --rotary-percent 1.0
++    --swiglu
++    --untie-embeddings-and-output-weights
++    --no-masked-softmax-fusion
++    --vocab-size 163840
++
++    --multi-latent-attention
++    --kv-lora-rank 512
++    --qk-head-dim 128
++    --qk-pos-emb-head-dim 64
++    --v-head-dim 128
++    --qk-layernorm
++    --rotary-scaling-factor 1
++    --rotary-base 50000
++    --mscale 1.0
++    --mscale-all-dim 1.0
++    --attention-softmax-in-fp32
++    --no-rope-fusion
++    --max-position-embeddings 8192  # 添加这一行  
++    --seq-length 1
++
++
++
++    # moe
++    --num-experts 64
++    --moe-layer-freq "[0,1,1]"
++    --moe-ffn-hidden-size $MOE_FFN_HIDDEN
++    --moe-router-topk 6
++    --moe-shared-expert-intermediate-size $MOE_SHARED_EXPERT_INTERMEDIATE_SIZE
++    --moe-router-pre-softmax
++    --moe-router-score-function sigmoid
++    --moe-router-enable-expert-bias
++    --moe-router-load-balancing-type seq_aux_loss
++    --moe-token-dispatcher-type alltoall
++    --moe-aux-loss-coeff 0
++    --moe-router-bias-update-rate 0
++    --moe-router-group-topk 1
++    --moe-router-num-groups 1
++    --moe-grouped-gemm
++    --moe-router-topk-scaling-factor $MOE_ROUTER_TOPK_SCALING_FACTOR
++    --moe-token-drop-policy probs
++    --moe-router-dtype fp32
++    --moe-permute-fusion
++)
++
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ 
+-GPUS_PER_NODE=8
++GPUS_PER_NODE=1
+ # Change for multinode config
+ MASTER_ADDR=localhost
+ MASTER_PORT=6000
+@@ -12,11 +86,11 @@ NUM_NODES=1
+ NODE_RANK=0
+ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
+ 
+-CHECKPOINT_PATH=$1 #<Specify path>
+-TENSORBOARD_LOGS_PATH=$2 #<Specify path>
+-VOCAB_FILE=$3 #<Specify path to file>/gpt2-vocab.json
+-MERGE_FILE=$4 #<Specify path to file>/gpt2-merges.txt
+-DATA_PATH=$5 #<Specify path and file prefix>_text_document
++CHECKPOINT_PATH=/afs/chatrl/public/models/Moonlight-16B-A3B_torch_dist
++TENSORBOARD_LOGS_PATH=./logs
++VOCAB_FILE=/afs/chatrl/public/models/Moonlight-16B-A3B/vocab.json
++MERGE_FILE=/afs/chatrl/public/models/Moonlight-16B-A3B/merges.txt
++DATA_PATH=/afs/chatrl/users/wxe/slime/data/DAPO-Math-17k.jsonl
+ 
+ DISTRIBUTED_ARGS=(
+     --nproc_per_node $GPUS_PER_NODE 
+@@ -25,26 +99,18 @@ DISTRIBUTED_ARGS=(
+     --master_port $MASTER_PORT
+ )
+ 
+-GPT_MODEL_ARGS=(
+-    --num-layers 96 
+-    --hidden-size 12288 
+-    --num-attention-heads 96 
+-    --seq-length 2048 
+-    --max-position-embeddings 2048 
+-    --attention-backend auto # Can use (flash/fused/unfused/local)
+-)
+ 
+ TRAINING_ARGS=(
+     --micro-batch-size 1 
+-    --global-batch-size 1536 
+-    --rampup-batch-size 16 16 5859375 
+-    --train-iters 500000 
++    --global-batch-size 1 
++    # --rampup-batch-size 16 16 5859375 ·
++    --train-iters 1
+     --weight-decay 0.1 
+     --adam-beta1 0.9 
+     --adam-beta2 0.95 
+     --init-method-std 0.006 
+     --clip-grad 1.0 
+-    --fp16
++    --bf16
+     --lr 6.0e-5 
+     --lr-decay-style cosine 
+     --min-lr 6.0e-6
+@@ -53,29 +119,32 @@ TRAINING_ARGS=(
+ )
+ 
+ MODEL_PARALLEL_ARGS=(
+-	--tensor-model-parallel-size 8 
+-	--pipeline-model-parallel-size 16 
++	--tensor-model-parallel-size 1
++	--pipeline-model-parallel-size 1
+ )
+ 
+ DATA_ARGS=(
+-    --data-path $DATA_PATH 
+-    --vocab-file $VOCAB_FILE 
+-    --merge-file $MERGE_FILE 
+-    --split 949,50,1
++    --data-path /root/Megatron-LM/dataset/hello_dataset_text_document
++    --tokenizer-type HuggingFaceTokenizer  
++    --tokenizer-model /afs/chatrl/public/models/Moonlight-16B-A3B/
++    --tiktoken-pattern v2     
++    --split 100,0,0  # 100% 训练, 0% 验证, 0% 测试  
++
+ )
+ 
+ EVAL_AND_LOGGING_ARGS=(
+-    --log-interval 100
+-    --save-interval 10000 
+-    --eval-interval 1000 
+-    --save $CHECKPOINT_PATH 
++    --log-interval 1
++    # --save-interval 10000 
++    # --eval-interval 1
++    # --save $CHECKPOINT_PATH 
+     --load $CHECKPOINT_PATH 
+-    --eval-iters 10
++    # --eval-iters 10
++    --finetune
+     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
+ )
+ 
+ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
+-    ${GPT_MODEL_ARGS[@]} \
++    ${MODEL_ARGS[@]} \
+     ${TRAINING_ARGS[@]} \
+     ${MODEL_PARALLEL_ARGS[@]} \
+     ${DATA_ARGS[@]} \
+diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gpt_model.py
+index 3ac631935..c50865ddb 100644
+--- a/megatron/core/models/gpt/gpt_model.py
++++ b/megatron/core/models/gpt/gpt_model.py
+@@ -366,6 +366,8 @@ class GPTModel(LanguageModule):
+             runtime_gather_output (bool): Gather output at runtime. Default None means
+                 `parallel_output` arg in the constructor will be used.
+         """
++        from megatron.core.moe.cache_context import MoECacheContext 
++        MoECacheContext.set_input_ids(input_ids[0].tolist()) 
+ 
+         inference_context = deprecate_inference_params(inference_context, inference_params)
+ 
+diff --git a/megatron/core/moe/cache_context.py b/megatron/core/moe/cache_context.py
+new file mode 100644
+index 000000000..3300d6738
+--- /dev/null
++++ b/megatron/core/moe/cache_context.py
+@@ -0,0 +1,21 @@
++import threading  
++from typing import Optional, List  
++  
++class MoECacheContext:  
++    """Thread-safe context for passing token IDs through forward pass"""  
++    _thread_local = threading.local()  
++      
++    @classmethod  
++    def set_input_ids(cls, input_ids: List[int]):  
++        """Set token IDs for current forward pass"""  
++        cls._thread_local.input_ids = input_ids  
++      
++    @classmethod  
++    def get_input_ids(cls) -> Optional[List[int]]:  
++        """Get token IDs for current forward pass"""  
++        return getattr(cls._thread_local, 'input_ids', None)  
++      
++    @classmethod  
++    def clear(cls):  
++        """Clear context after forward pass"""  
++        cls._thread_local.input_ids = None
+\ No newline at end of file
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+index 9f5e150a9..52408afcf 100644
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -568,8 +568,8 @@ def topk_routing_with_score_function(
+         else:
+             return torch.topk(scores, k=topk, dim=1)
+ 
+-    from slime.utils.routing_replay import get_routing_replay_compute_topk
+-    compute_topk = get_routing_replay_compute_topk(compute_topk)
++    # from slime.utils.routing_replay import get_routing_replay_compute_topk
++    # compute_topk = get_routing_replay_compute_topk(compute_topk)
+ 
+     if score_function == "softmax":
+         if use_pre_softmax:
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 73da4e232..0b65b1d24 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -1,11 +1,15 @@
+ # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ 
++import hashlib
+ import os
+ from abc import ABC, abstractmethod
+-from typing import Optional
++import threading
++from typing import Optional, Tuple
+ 
++import requests
+ import torch
+ 
++from megatron.core.moe.cache_context import MoECacheContext  
+ from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
+ from megatron.core.transformer.module import MegatronModule
+ from megatron.core.transformer.moe.moe_utils import (
+@@ -45,7 +49,6 @@ class Router(ABC, MegatronModule):
+         self.tp_group = model_comm_pgs.tp
+         self.cp_group = model_comm_pgs.cp
+         self.tp_cp_group = model_comm_pgs.tp_cp
+-
+         # Initialize the gate weights.
+         # TODO: Add support for GPU initialization, which requires updating the golden values.
+         self.weight = torch.nn.Parameter(
+@@ -156,9 +159,8 @@ class TopKRouter(Router):
+         else:
+             self.local_tokens_per_expert = None
+             self.expert_bias = None
+-
+-        from slime.utils.routing_replay import register_routing_replay
+-        register_routing_replay(self)
++        # from slime.utils.routing_replay import register_routing_replay
++        # register_routing_replay(self)
+ 
+     def _maintain_float32_expert_bias(self):
+         """
+@@ -454,25 +456,42 @@ class TopKRouter(Router):
+         return probs, routing_map
+ 
+     def forward(self, input: torch.Tensor):
+-        """
+-        Forward pass of the router.
+-
+-        Args:
+-            input (torch.Tensor): Input tensor.
+-        """
+         self._maintain_float32_expert_bias()
++        self.token_ids = MoECacheContext.get_input_ids()    
+ 
+-        # Apply input jitter
+         input = self.apply_input_jitter(input)
+         logits = self.gating(input)
+ 
+         if self.config.moe_router_force_load_balancing:
+-            # Apply force load balancing with random logits for benchmark
+             logits = apply_random_logits(logits)
+-
+         probs, routing_map = self.routing(logits)
+-
+-        return probs, routing_map
++        verify_topk_ids, verify_topk_weights = self.query_routing_cache(self.token_ids)
++        topk_ids = verify_topk_ids[self.layer_number-1].unsqueeze(0)  
++        scores = torch.softmax(logits, dim=-1)  
++        # probs_topk = scores.gather(1, topk_ids)  # 梯度可以流回 logits          
++        num_tokens = input.shape[0]  
++        routing_map_cached = torch.zeros(
++            (num_tokens, self.config.num_moe_experts),   
++            dtype=torch.bool,   
++            device=input.device  
++        )  
++        routing_map_cached.scatter_(  
++            dim=1,  
++            index=verify_topk_ids[self.layer_number-1].unsqueeze(0), 
++            value=True  
++        )  
++        probs_cached = torch.zeros(  
++            (num_tokens, self.config.num_moe_experts),  
++            dtype=torch.float32,  
++            device=input.device  
++        )  
++        probs_cached.scatter_(  
++            dim=1,  
++            index=verify_topk_ids[self.layer_number-1].unsqueeze(0), 
++            src=verify_topk_weights[self.layer_number-1].unsqueeze(0)
++        )  
++
++        return probs_cached, routing_map_cached
+ 
+     def _load_from_state_dict(self, *args, **kwargs):
+         """Load the state dict of the router."""
+@@ -483,3 +502,56 @@ class TopKRouter(Router):
+         """Save the state dict of the router."""
+         self._maintain_float32_expert_bias()  # switch to float32 before saving
+         return super()._save_to_state_dict(*args, **kwargs)
++
++    def _compute_hash_key(self, token_ids: torch.Tensor) -> str:  
++        hasher = hashlib.sha256()  
++        for t in token_ids:  
++            hasher.update(t.to_bytes(4, byteorder="little", signed=False))  
++        return hasher.hexdigest()  
++
++    def query_routing_cache(  
++        self,   
++        token_ids: torch.Tensor,  
++    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:  
++        hash_key = self._compute_hash_key(token_ids)  
++        print(f"Querying routing cache with key: {hash_key}")
++            
++        response = requests.post(  
++            f"http://0.0.0.0:8000/batch_get",  
++            json={"keys": [hash_key]},  
++            timeout=0.1  # 快速超时避免阻塞  
++        )   
++        data = response.json()["data"][0]  
++        if data is None:  
++            return None, None            
++        topk_ids = torch.tensor(  
++            data[:len(data)//2],   
++            dtype=torch.int32,   
++            device=torch.cuda.current_device()
++        ).reshape(-1, self.config.moe_router_topk)  
++            
++        topk_weights = torch.tensor(  
++            data[len(data)//2:],   
++            dtype=torch.float32,   
++            device=torch.cuda.current_device()
++        ).reshape(-1, self.config.moe_router_topk)  
++        return topk_ids, topk_weights  
++              
++      
++    def write_routing_cache(  
++        self,  
++        token_ids: torch.Tensor,  
++        topk_ids: torch.Tensor,  
++        topk_weights: torch.Tensor  
++    ):  
++          
++        hash_key = self._compute_hash_key(token_ids)      
++        topk_ids_flat = topk_ids.cpu().int().flatten().tolist()  
++        topk_weights_flat = topk_weights.cpu().float().flatten().tolist()  
++        combined_data = topk_ids_flat + topk_weights_flat  
++
++        requests.post(  
++            f"http://0.0.0.0:8000/batch_set",  
++            json={"keys": [hash_key], "data": [combined_data]},  
++            timeout=1.0  
++        )            
+\ No newline at end of file
+diff --git a/megatron/training/tokenizer/tokenizer.py b/megatron/training/tokenizer/tokenizer.py
+index 5cf222ccc..69b798424 100644
+--- a/megatron/training/tokenizer/tokenizer.py
++++ b/megatron/training/tokenizer/tokenizer.py
+@@ -47,7 +47,7 @@ def build_tokenizer(args, **kwargs):
+         assert args.tokenizer_model is not None
+         tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
+     elif args.tokenizer_type == 'HuggingFaceTokenizer':
+-        tokenizer = _HuggingFaceTokenizer(args.tokenizer_model, **kwargs)
++        tokenizer = _HuggingFaceTokenizer(args.tokenizer_model,trust_remote_code=True, **kwargs)
+     elif args.tokenizer_type == 'Llama2Tokenizer':
+         assert args.tokenizer_model is not None
+         tokenizer = _Llama2Tokenizer(args.tokenizer_model)
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 83626c6cb..b0abd92b0 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -2477,6 +2477,7 @@ def evaluate_and_print_results(
+     non_loss_data_func=None,
+ ):
+     """Helper function to evaluate and dump results on screen."""
++    return
+     args = get_args()
+     if write_to_tensorboard:
+         writer = get_tensorboard_writer()
