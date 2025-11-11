@@ -181,10 +181,10 @@ index 7d2c01b31..49f84005c 100755
      ${MODEL_PARALLEL_ARGS[@]} \
      ${DATA_ARGS[@]} \
 diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gpt_model.py
-index 3ac631935..c50865ddb 100644
+index 7aa4b2f7d..948535586 100644
 --- a/megatron/core/models/gpt/gpt_model.py
 +++ b/megatron/core/models/gpt/gpt_model.py
-@@ -366,6 +366,8 @@ class GPTModel(LanguageModule):
+@@ -367,6 +367,8 @@ class GPTModel(LanguageModule):
              runtime_gather_output (bool): Gather output at runtime. Default None means
                  `parallel_output` arg in the constructor will be used.
          """
@@ -222,10 +222,10 @@ index 000000000..3300d6738
 +        cls._thread_local.input_ids = None
 \ No newline at end of file
 diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
-index 9f5e150a9..52408afcf 100644
+index fbcffe278..383d083e8 100644
 --- a/megatron/core/transformer/moe/moe_utils.py
 +++ b/megatron/core/transformer/moe/moe_utils.py
-@@ -568,8 +568,8 @@ def topk_routing_with_score_function(
+@@ -566,8 +566,8 @@ def topk_routing_with_score_function(
          else:
              return torch.topk(scores, k=topk, dim=1)
  
@@ -237,27 +237,10 @@ index 9f5e150a9..52408afcf 100644
      if score_function == "softmax":
          if use_pre_softmax:
 diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
-index 73da4e232..0b65b1d24 100644
+index 459e65921..3746b6118 100644
 --- a/megatron/core/transformer/moe/router.py
 +++ b/megatron/core/transformer/moe/router.py
-@@ -1,11 +1,15 @@
- # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
- 
-+import hashlib
- import os
- from abc import ABC, abstractmethod
--from typing import Optional
-+import threading
-+from typing import Optional, Tuple
- 
-+import requests
- import torch
- 
-+from megatron.core.moe.cache_context import MoECacheContext  
- from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
- from megatron.core.transformer.module import MegatronModule
- from megatron.core.transformer.moe.moe_utils import (
-@@ -45,7 +49,6 @@ class Router(ABC, MegatronModule):
+@@ -44,7 +44,6 @@ class Router(ABC, MegatronModule):
          self.tp_group = model_comm_pgs.tp
          self.cp_group = model_comm_pgs.cp
          self.tp_cp_group = model_comm_pgs.tp_cp
@@ -265,7 +248,7 @@ index 73da4e232..0b65b1d24 100644
          # Initialize the gate weights.
          # TODO: Add support for GPU initialization, which requires updating the golden values.
          self.weight = torch.nn.Parameter(
-@@ -156,9 +159,8 @@ class TopKRouter(Router):
+@@ -155,9 +154,8 @@ class TopKRouter(Router):
          else:
              self.local_tokens_per_expert = None
              self.expert_bias = None
@@ -277,7 +260,7 @@ index 73da4e232..0b65b1d24 100644
  
      def _maintain_float32_expert_bias(self):
          """
-@@ -454,25 +456,42 @@ class TopKRouter(Router):
+@@ -453,25 +451,42 @@ class TopKRouter(Router):
          return probs, routing_map
  
      def forward(self, input: torch.Tensor):
@@ -331,7 +314,7 @@ index 73da4e232..0b65b1d24 100644
  
      def _load_from_state_dict(self, *args, **kwargs):
          """Load the state dict of the router."""
-@@ -483,3 +502,56 @@ class TopKRouter(Router):
+@@ -482,3 +497,56 @@ class TopKRouter(Router):
          """Save the state dict of the router."""
          self._maintain_float32_expert_bias()  # switch to float32 before saving
          return super()._save_to_state_dict(*args, **kwargs)
@@ -390,7 +373,7 @@ index 73da4e232..0b65b1d24 100644
 +        )            
 \ No newline at end of file
 diff --git a/megatron/training/tokenizer/tokenizer.py b/megatron/training/tokenizer/tokenizer.py
-index 5cf222ccc..69b798424 100644
+index d1554ca4c..c5b455d85 100644
 --- a/megatron/training/tokenizer/tokenizer.py
 +++ b/megatron/training/tokenizer/tokenizer.py
 @@ -47,7 +47,7 @@ def build_tokenizer(args, **kwargs):
