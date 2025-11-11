@@ -237,10 +237,22 @@ index fbcffe278..383d083e8 100644
      if score_function == "softmax":
          if use_pre_softmax:
 diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
-index 459e65921..3746b6118 100644
+index 459e65921..d623ec4a7 100644
 --- a/megatron/core/transformer/moe/router.py
 +++ b/megatron/core/transformer/moe/router.py
-@@ -44,7 +44,6 @@ class Router(ABC, MegatronModule):
+@@ -1,8 +1,10 @@
+ # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ 
+ from abc import ABC, abstractmethod
+-from typing import Optional
++import hashlib
++from typing import Optional, Tuple
+ 
++import requests
+ import torch
+ 
+ from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
+@@ -44,7 +46,6 @@ class Router(ABC, MegatronModule):
          self.tp_group = model_comm_pgs.tp
          self.cp_group = model_comm_pgs.cp
          self.tp_cp_group = model_comm_pgs.tp_cp
@@ -248,7 +260,7 @@ index 459e65921..3746b6118 100644
          # Initialize the gate weights.
          # TODO: Add support for GPU initialization, which requires updating the golden values.
          self.weight = torch.nn.Parameter(
-@@ -155,9 +154,8 @@ class TopKRouter(Router):
+@@ -155,9 +156,8 @@ class TopKRouter(Router):
          else:
              self.local_tokens_per_expert = None
              self.expert_bias = None
@@ -260,7 +272,7 @@ index 459e65921..3746b6118 100644
  
      def _maintain_float32_expert_bias(self):
          """
-@@ -453,25 +451,42 @@ class TopKRouter(Router):
+@@ -453,25 +453,42 @@ class TopKRouter(Router):
          return probs, routing_map
  
      def forward(self, input: torch.Tensor):
@@ -314,7 +326,7 @@ index 459e65921..3746b6118 100644
  
      def _load_from_state_dict(self, *args, **kwargs):
          """Load the state dict of the router."""
-@@ -482,3 +497,56 @@ class TopKRouter(Router):
+@@ -482,3 +499,56 @@ class TopKRouter(Router):
          """Save the state dict of the router."""
          self._maintain_float32_expert_bias()  # switch to float32 before saving
          return super()._save_to_state_dict(*args, **kwargs)

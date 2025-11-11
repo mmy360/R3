@@ -405,7 +405,7 @@ index 4fefac9..055c18e 100644
 +            self.free_pages = torch.cat((self.free_pages, free_index))
 \ No newline at end of file
 diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
-index 8f96ba0..fa46770 100644
+index 8f96ba0..ee3882f 100644
 --- a/python/sglang/srt/mem_cache/common.py
 +++ b/python/sglang/srt/mem_cache/common.py
 @@ -7,6 +7,7 @@ import torch
@@ -450,7 +450,7 @@ index 8f96ba0..fa46770 100644
 +        moe_prefix_lens_device = moe_prefix_lens_cpu.to(batch.device, non_blocking=True)  
 +        moe_extend_lens_device = moe_extend_lens_cpu.to(batch.device, non_blocking=True)  
 +
-+        moe_req_pool_indices = alloc_req_slots(batch.moe_req_to_token_pool, bs, batch.reqs)        
++        moe_req_pool_indices = alloc_req_slots(batch.moe_req_to_token_pool, bs, batch.moe_tree_cache)        
 +        moe_req_pool_indices_cpu = torch.tensor(moe_req_pool_indices, dtype=torch.int64)  
 +        moe_req_pool_indices_device = moe_req_pool_indices_cpu.to(batch.device, non_blocking=True)  
 +        for req, idx in zip(batch.reqs, moe_req_pool_indices):  
