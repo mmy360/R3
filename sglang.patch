@@ -405,7 +405,7 @@ index 4fefac9..055c18e 100644
 +            self.free_pages = torch.cat((self.free_pages, free_index))
 \ No newline at end of file
 diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
-index 8f96ba0..ee3882f 100644
+index 8f96ba0..ff5234a 100644
 --- a/python/sglang/srt/mem_cache/common.py
 +++ b/python/sglang/srt/mem_cache/common.py
 @@ -7,6 +7,7 @@ import torch
@@ -450,7 +450,7 @@ index 8f96ba0..ee3882f 100644
 +        moe_prefix_lens_device = moe_prefix_lens_cpu.to(batch.device, non_blocking=True)  
 +        moe_extend_lens_device = moe_extend_lens_cpu.to(batch.device, non_blocking=True)  
 +
-+        moe_req_pool_indices = alloc_req_slots(batch.moe_req_to_token_pool, bs, batch.moe_tree_cache)        
++        moe_req_pool_indices = alloc_req_slots(batch.moe_req_to_token_pool, bs, batch.reqs, batch.moe_tree_cache)        
 +        moe_req_pool_indices_cpu = torch.tensor(moe_req_pool_indices, dtype=torch.int64)  
 +        moe_req_pool_indices_device = moe_req_pool_indices_cpu.to(batch.device, non_blocking=True)  
 +        for req, idx in zip(batch.reqs, moe_req_pool_indices):  
@@ -523,7 +523,7 @@ index 8f96ba0..ee3882f 100644
  
  
 diff --git a/python/sglang/srt/mem_cache/hiradix_cache.py b/python/sglang/srt/mem_cache/hiradix_cache.py
-index 6ea4e1b..8e81609 100644
+index 6ea4e1b..a5abe66 100644
 --- a/python/sglang/srt/mem_cache/hiradix_cache.py
 +++ b/python/sglang/srt/mem_cache/hiradix_cache.py
 @@ -8,16 +8,20 @@ from typing import List, Optional
@@ -582,7 +582,7 @@ index 6ea4e1b..8e81609 100644
          prefix_keys = (
              node.get_prefix_hash_values(node.parent)
              if self.hicache_storage_pass_prefix_keys
-@@ -947,3 +965,90 @@ class HiRadixCache(RadixCache):
+@@ -947,3 +965,91 @@ class HiRadixCache(RadixCache):
          del self.ongoing_prefetch[rid]
          self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
          self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
@@ -673,7 +673,7 @@ index 6ea4e1b..8e81609 100644
 +
 +        self.req_to_token_pool.free(req.moe_req_pool_idx)  
 +        self.dec_lock_ref(req.moe_last_node)
-\ No newline at end of file
++        self.check_hicache_events()
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
 index 975c727..61fc953 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
@@ -1263,10 +1263,10 @@ index 4b195c8..e2c2d27 100644
 \ No newline at end of file
 diff --git a/python/sglang/srt/mem_cache/storage/http_backend/storage_http.py b/python/sglang/srt/mem_cache/storage/http_backend/storage_http.py
 new file mode 100644
-index 0000000..bdc6cb6
+index 0000000..bfe3eae
 --- /dev/null
 +++ b/python/sglang/srt/mem_cache/storage/http_backend/storage_http.py
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,228 @@
 +import asyncio
 +import logging
 +
@@ -1436,12 +1436,14 @@ index 0000000..bdc6cb6
 +            results = []  
 +            for key, data in zip(request.keys, request.data):  
 +                storage[key] = data  
-+                results.append(True)  
 +            return {"results": results}  
 +        
 +        @app.post("/batch_get")  
-+        async def batch_get(request: BatchGetRequest):  
++        async def batch_get(request: BatchGetRequest): 
++
 +            data = [storage.get(key) for key in request.keys] 
++            for key in request.keys:
++                logger.info(f"Getting Sucess {key}")
 +            return {"data": data}  
 +        
 +        @app.post("/batch_exists")  

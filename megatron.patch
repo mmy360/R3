@@ -237,7 +237,7 @@ index fbcffe278..383d083e8 100644
      if score_function == "softmax":
          if use_pre_softmax:
 diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
-index 459e65921..d623ec4a7 100644
+index 459e65921..fa1faeabc 100644
 --- a/megatron/core/transformer/moe/router.py
 +++ b/megatron/core/transformer/moe/router.py
 @@ -1,8 +1,10 @@
@@ -252,6 +252,15 @@ index 459e65921..d623ec4a7 100644
  import torch
  
  from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
+@@ -21,7 +23,7 @@ from megatron.core.transformer.moe.moe_utils import (
+     z_loss_func,
+ )
+ from megatron.core.transformer.transformer_config import TransformerConfig
+-
++from megatron.core.moe.cache_context import MoECacheContext 
+ 
+ class Router(ABC, MegatronModule):
+     """Base Router class"""
 @@ -44,7 +46,6 @@ class Router(ABC, MegatronModule):
          self.tp_group = model_comm_pgs.tp
          self.cp_group = model_comm_pgs.cp
@@ -272,7 +281,7 @@ index 459e65921..d623ec4a7 100644
  
      def _maintain_float32_expert_bias(self):
          """
-@@ -453,25 +453,42 @@ class TopKRouter(Router):
+@@ -453,25 +453,44 @@ class TopKRouter(Router):
          return probs, routing_map
  
      def forward(self, input: torch.Tensor):
@@ -293,10 +302,13 @@ index 459e65921..d623ec4a7 100644
 -            # Apply force load balancing with random logits for benchmark
              logits = apply_random_logits(logits)
 -
-         probs, routing_map = self.routing(logits)
+-        probs, routing_map = self.routing(logits)
 -
 -        return probs, routing_map
 +        verify_topk_ids, verify_topk_weights = self.query_routing_cache(self.token_ids)
++        if verify_topk_ids is None and verify_topk_weights is None:
++            probs, routing_map = self.routing(logits)
++            return probs, routing_map 
 +        topk_ids = verify_topk_ids[self.layer_number-1].unsqueeze(0)  
 +        scores = torch.softmax(logits, dim=-1)  
 +        # probs_topk = scores.gather(1, topk_ids)  # 梯度可以流回 logits          
@@ -326,13 +338,16 @@ index 459e65921..d623ec4a7 100644
  
      def _load_from_state_dict(self, *args, **kwargs):
          """Load the state dict of the router."""
-@@ -482,3 +499,56 @@ class TopKRouter(Router):
+@@ -482,3 +501,59 @@ class TopKRouter(Router):
          """Save the state dict of the router."""
          self._maintain_float32_expert_bias()  # switch to float32 before saving
          return super()._save_to_state_dict(*args, **kwargs)
 +
 +    def _compute_hash_key(self, token_ids: torch.Tensor) -> str:  
 +        hasher = hashlib.sha256()  
++        print(len(token_ids))
++        if len(token_ids) == 0:
++            return 
 +        for t in token_ids:  
 +            hasher.update(t.to_bytes(4, byteorder="little", signed=False))  
 +        return hasher.hexdigest()  
