@@ -523,7 +523,7 @@ index 8f96ba0..ff5234a 100644
  
  
 diff --git a/python/sglang/srt/mem_cache/hiradix_cache.py b/python/sglang/srt/mem_cache/hiradix_cache.py
-index 6ea4e1b..a5abe66 100644
+index 6ea4e1b..df44c31 100644
 --- a/python/sglang/srt/mem_cache/hiradix_cache.py
 +++ b/python/sglang/srt/mem_cache/hiradix_cache.py
 @@ -8,16 +8,20 @@ from typing import List, Optional
@@ -651,7 +651,7 @@ index 6ea4e1b..a5abe66 100644
 +            page_aligned_len = all_token_len  
 +            page_aligned_moe_indices = moe_indices.to(dtype=torch.int64, copy=True)  
 +    
-+        token_ids = (req.origin_input_ids + req.output_ids)[:page_aligned_len]  
++        token_ids = (req.origin_input_ids + req.output_ids)[:page_aligned_len]
 +        old_prefix_len = len(req.moe_prefix_indices) if req.moe_prefix_indices is not None else 0  
 +    
 +        if is_insert:  
@@ -675,10 +675,27 @@ index 6ea4e1b..a5abe66 100644
 +        self.dec_lock_ref(req.moe_last_node)
 +        self.check_hicache_events()
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index 975c727..61fc953 100644
+index 46e2c7c..61fc953 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
-@@ -1918,3 +1918,138 @@ def copy_all_layer_kv_cache_tiled(
+@@ -809,6 +809,7 @@ class HybridLinearKVPool(KVCache):
+         enable_kvcache_transpose: bool,
+         device: str,
+         mamba_pool: MambaPool,
++        enable_memory_saver: bool,
+     ):
+         self.size = size
+         self.dtype = dtype
+@@ -834,7 +835,7 @@ class HybridLinearKVPool(KVCache):
+             head_dim=head_dim,
+             layer_num=self.full_layer_nums,
+             device=device,
+-            enable_memory_saver=False,
++            enable_memory_saver=enable_memory_saver,
+         )
+         self.full_attention_layer_id_mapping = {
+             id: i for i, id in enumerate(full_attention_layer_ids)
+@@ -1917,3 +1918,138 @@ def copy_all_layer_kv_cache_tiled(
      mask = mask_loc[:, None] & mask_byte[None, :]
      vals = tl.load(src_ptr, mask=mask)
      tl.store(tgt_ptr, vals, mask=mask)
@@ -1263,10 +1280,10 @@ index 4b195c8..e2c2d27 100644
 \ No newline at end of file
 diff --git a/python/sglang/srt/mem_cache/storage/http_backend/storage_http.py b/python/sglang/srt/mem_cache/storage/http_backend/storage_http.py
 new file mode 100644
-index 0000000..bfe3eae
+index 0000000..76046a0
 --- /dev/null
 +++ b/python/sglang/srt/mem_cache/storage/http_backend/storage_http.py
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,226 @@
 +import asyncio
 +import logging
 +
@@ -1440,10 +1457,8 @@ index 0000000..bfe3eae
 +        
 +        @app.post("/batch_get")  
 +        async def batch_get(request: BatchGetRequest): 
-+
 +            data = [storage.get(key) for key in request.keys] 
-+            for key in request.keys:
-+                logger.info(f"Getting Sucess {key}")
++            print("hihihi", len(data))
 +            return {"data": data}  
 +        
 +        @app.post("/batch_exists")  
@@ -1519,7 +1534,7 @@ index 82ea20f..1c4e3d3 100644
          device = model_runner.device
  
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 34afad0..0027673 100644
+index 0dbb6ee..0027673 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -84,6 +84,7 @@ from sglang.srt.lora.lora_manager import LoRAManager
@@ -1544,7 +1559,24 @@ index 34afad0..0027673 100644
  from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
  from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
  from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-@@ -1803,6 +1807,32 @@ class ModelRunner:
+@@ -734,7 +738,7 @@ class ModelRunner:
+ 
+         with self.memory_saver_adapter.region(
+             GPU_MEMORY_TYPE_WEIGHTS,
+-            enable_cpu_backup=self.server_args.enable_weights_cpu_backup,
++            enable_cpu_backup=self.server_args.enable_weights_cpu_backup if not self.is_draft_worker else True,
+         ):
+             self.model = get_model(
+                 model_config=self.model_config,
+@@ -1735,6 +1739,7 @@ class ModelRunner:
+                     enable_kvcache_transpose=False,
+                     device=self.device,
+                     mamba_pool=self.req_to_token_pool.mamba_pool,
++                    enable_memory_saver=self.server_args.enable_memory_saver,
+                 )
+             else:
+                 self.token_to_kv_pool = MHATokenToKVPool(
+@@ -1802,6 +1807,32 @@ class ModelRunner:
          else:
              assert self.is_draft_worker
  

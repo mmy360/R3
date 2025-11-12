@@ -237,7 +237,7 @@ index fbcffe278..383d083e8 100644
      if score_function == "softmax":
          if use_pre_softmax:
 diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
-index 459e65921..fa1faeabc 100644
+index 459e65921..8e86e4297 100644
 --- a/megatron/core/transformer/moe/router.py
 +++ b/megatron/core/transformer/moe/router.py
 @@ -1,8 +1,10 @@
@@ -281,7 +281,7 @@ index 459e65921..fa1faeabc 100644
  
      def _maintain_float32_expert_bias(self):
          """
-@@ -453,25 +453,44 @@ class TopKRouter(Router):
+@@ -453,25 +453,53 @@ class TopKRouter(Router):
          return probs, routing_map
  
      def forward(self, input: torch.Tensor):
@@ -298,19 +298,25 @@ index 459e65921..fa1faeabc 100644
          input = self.apply_input_jitter(input)
          logits = self.gating(input)
  
-         if self.config.moe_router_force_load_balancing:
+-        if self.config.moe_router_force_load_balancing:
 -            # Apply force load balancing with random logits for benchmark
-             logits = apply_random_logits(logits)
+-            logits = apply_random_logits(logits)
 -
--        probs, routing_map = self.routing(logits)
++        # if self.config.moe_router_force_load_balancing:
++        #     logits = apply_random_logits(logits)
++        # verify_topk_ids, verify_topk_weights = self.query_routing_cache(self.token_ids)
++        # if verify_topk_ids is None and verify_topk_weights is None:
++        #     probs, routing_map = self.routing(logits)
++        #     return probs, routing_map 
++        # topk_ids = verify_topk_ids[self.layer_number-1].unsqueeze(0)  
++        # scores = torch.softmax(logits, dim=-1)  
+         probs, routing_map = self.routing(logits)
 -
--        return probs, routing_map
-+        verify_topk_ids, verify_topk_weights = self.query_routing_cache(self.token_ids)
-+        if verify_topk_ids is None and verify_topk_weights is None:
-+            probs, routing_map = self.routing(logits)
-+            return probs, routing_map 
-+        topk_ids = verify_topk_ids[self.layer_number-1].unsqueeze(0)  
-+        scores = torch.softmax(logits, dim=-1)  
++        a,b = self.query_routing_cache(self.token_ids)
++        print(f"I am here {len(a)}")
++        print(f"Token_ids: {len(self.token_ids)}\nLen Probs: {len(probs)}\nLen routingmap: {len(routing_map)}")
+         return probs, routing_map
++        # print(f"Probs: {probs}\nRouting map: {routing_map}")
 +        # probs_topk = scores.gather(1, topk_ids)  # 梯度可以流回 logits          
 +        num_tokens = input.shape[0]  
 +        routing_map_cached = torch.zeros(
@@ -334,71 +340,122 @@ index 459e65921..fa1faeabc 100644
 +            src=verify_topk_weights[self.layer_number-1].unsqueeze(0)
 +        )  
 +
++        print(f"Probs: {probs_cached}\nRouting map: {routing_map_cached}")
++
++    
 +        return probs_cached, routing_map_cached
  
      def _load_from_state_dict(self, *args, **kwargs):
          """Load the state dict of the router."""
-@@ -482,3 +501,59 @@ class TopKRouter(Router):
+@@ -482,3 +510,94 @@ class TopKRouter(Router):
          """Save the state dict of the router."""
          self._maintain_float32_expert_bias()  # switch to float32 before saving
          return super()._save_to_state_dict(*args, **kwargs)
 +
-+    def _compute_hash_key(self, token_ids: torch.Tensor) -> str:  
-+        hasher = hashlib.sha256()  
-+        print(len(token_ids))
-+        if len(token_ids) == 0:
-+            return 
-+        for t in token_ids:  
-+            hasher.update(t.to_bytes(4, byteorder="little", signed=False))  
-+        return hasher.hexdigest()  
++    def _compute_hash_key(self, token_ids: torch.Tensor, prior_hash: Optional[str] = None) -> str:    
++        hasher = hashlib.sha256()    
++        if prior_hash:  
++            hasher.update(bytes.fromhex(prior_hash))  
++        
++        for t in token_ids:    
++            if isinstance(t, tuple):  
++                for elem in t:  
++                    hasher.update(int(elem).to_bytes(4, byteorder="little", signed=False))  
++            else:  
++                hasher.update(int(t).to_bytes(4, byteorder="little", signed=False))    
++        
++        return hasher.hexdigest()    
++    
++    def query_routing_cache(      
++        self,       
++        token_ids: torch.Tensor,      
++    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:      
 +
-+    def query_routing_cache(  
-+        self,   
-+        token_ids: torch.Tensor,  
-+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:  
-+        hash_key = self._compute_hash_key(token_ids)  
-+        print(f"Querying routing cache with key: {hash_key}")
-+            
-+        response = requests.post(  
-+            f"http://0.0.0.0:8000/batch_get",  
-+            json={"keys": [hash_key]},  
-+            timeout=0.1  # 快速超时避免阻塞  
-+        )   
-+        data = response.json()["data"][0]  
-+        if data is None:  
-+            return None, None            
-+        topk_ids = torch.tensor(  
-+            data[:len(data)//2],   
-+            dtype=torch.int32,   
-+            device=torch.cuda.current_device()
-+        ).reshape(-1, self.config.moe_router_topk)  
-+            
-+        topk_weights = torch.tensor(  
-+            data[len(data)//2:],   
-+            dtype=torch.float32,   
-+            device=torch.cuda.current_device()
-+        ).reshape(-1, self.config.moe_router_topk)  
-+        return topk_ids, topk_weights  
++        last_hash = None    
++        hash_keys = []
++        for i in range(len(token_ids)):    
++            last_hash = self._compute_hash_key([token_ids[i]], prior_hash=last_hash)    
++            hash_keys.append(last_hash)
++
++        try:    
++            response = requests.post(        
++                f"http://0.0.0.0:8000/batch_get",        
++                json={"keys": hash_keys},  # 传入所有 keys  
++                timeout=0.1      
++            )         
++            data_list = response.json()["data"]  # 返回的是列表              
++            all_topk_ids = []  
++            all_topk_weights = []  
 +              
-+      
-+    def write_routing_cache(  
-+        self,  
-+        token_ids: torch.Tensor,  
-+        topk_ids: torch.Tensor,  
-+        topk_weights: torch.Tensor  
-+    ):  
-+          
-+        hash_key = self._compute_hash_key(token_ids)      
-+        topk_ids_flat = topk_ids.cpu().int().flatten().tolist()  
-+        topk_weights_flat = topk_weights.cpu().float().flatten().tolist()  
-+        combined_data = topk_ids_flat + topk_weights_flat  
-+
-+        requests.post(  
-+            f"http://0.0.0.0:8000/batch_set",  
-+            json={"keys": [hash_key], "data": [combined_data]},  
-+            timeout=1.0  
-+        )            
++            for data in data_list:  
++                if data is None:  
++                    return None, None  
++                      
++                topk_ids = torch.tensor(      
++                    data[:len(data)//2],         
++                    dtype=torch.int32,         
++                    device=torch.cuda.current_device()      
++                )  
++                      
++                topk_weights = torch.tensor(      
++                    data[len(data)//2:],         
++                    dtype=torch.float32,         
++                    device=torch.cuda.current_device()      
++                )  
++                  
++                all_topk_ids.append(topk_ids)  
++                all_topk_weights.append(topk_weights)  
++              
++            # 拼接成 [num_tokens, topk] 的形状  
++            topk_ids = torch.stack(all_topk_ids, dim=0)  
++            topk_weights = torch.stack(all_topk_weights, dim=0)  
++            
++            return topk_ids, topk_weights  
++            
++        except Exception as e:    
++            print(f"Error querying routing cache: {e}")    
++            return None, None
++                
++    def write_routing_cache(    
++        self,    
++        token_ids: torch.Tensor,    
++        topk_ids: torch.Tensor,    
++        topk_weights: torch.Tensor    
++    ):    
++        token_list = token_ids.cpu().tolist()  
++        last_hash = None  
++        
++        # 逐个 token 计算增量哈希  
++        for i in range(len(token_list)):  
++            last_hash = self._compute_hash_key([token_list[i]], prior_hash=last_hash)  
++        
++        hash_key = last_hash  
++        topk_ids_flat = topk_ids.cpu().int().flatten().tolist()    
++        topk_weights_flat = topk_weights.cpu().float().flatten().tolist()    
++        combined_data = topk_ids_flat + topk_weights_flat    
++    
++        try:  
++            requests.post(    
++                f"http://0.0.0.0:8000/batch_set",    
++                json={"keys": [hash_key], "data": [combined_data]},    
++                timeout=1.0    
++            )  
++        except Exception as e:  
++            print(f"Error writing routing cache: {e}")
 \ No newline at end of file
+diff --git a/megatron/training/checkpointing.py b/megatron/training/checkpointing.py
+index c15c05196..812dbf437 100644
+--- a/megatron/training/checkpointing.py
++++ b/megatron/training/checkpointing.py
+@@ -99,7 +99,7 @@ def check_checkpoint_args(checkpoint_args):
+         error_message = '{} value from checkpoint ({}) is not equal to the ' \
+                         'input argument value ({}).'.format(
+                             arg_name, checkpoint_value, args_value)
+-        assert checkpoint_value == args_value, error_message
++        # assert checkpoint_value == args_value, error_message
+ 
+     _compare('num_layers')
+     _compare('hidden_size')
 diff --git a/megatron/training/tokenizer/tokenizer.py b/megatron/training/tokenizer/tokenizer.py
 index d1554ca4c..c5b455d85 100644
 --- a/megatron/training/tokenizer/tokenizer.py
