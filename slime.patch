@@ -1,0 +1,420 @@
+diff --git a/scripts/run-moonlight.sh b/scripts/run-moonlight.sh
+new file mode 100755
+index 0000000..50d7be0
+--- /dev/null
++++ b/scripts/run-moonlight.sh
+@@ -0,0 +1,213 @@
++#!/bin/bash
++
++# for rerun the task
++pkill -9 sglang
++sleep 3
++ray stop --force
++pkill -9 ray
++pkill -9 python
++sleep 3
++pkill -9 ray
++pkill -9 python
++
++set -ex
++
++# will prevent ray from buffering stdout/stderr
++export PYTHONBUFFERED=0
++export CUDNN_LOGERR_DBG=1
++
++
++NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
++if [ "$NVLINK_COUNT" -gt 0 ]; then
++    HAS_NVLINK=1
++else
++    HAS_NVLINK=0
++fi
++echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
++
++SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
++source "${SCRIPT_DIR}/models/moonlight.sh"
++
++CKPT_ARGS=(
++   --hf-checkpoint /afs/chatrl/public/models/Moonlight-16B-A3B
++   #--hf-checkpoint $BASE_DIR/DeepSeek-R1-bf16/
++   --ref-load /afs/chatrl/public/models/Moonlight-16B-A3B_torch_dist
++   --load /afs/chatrl/public/models/Moonlight-16B-A3B_torch_dist
++   --save $BASE_DIR/DeepSeek-R1_slime/
++   --save-interval 20
++)
++
++ROLLOUT_ARGS=(
++   --prompt-data /afs/chatrl/users/wxe/slime/data/DAPO-Math-17k.jsonl
++   --input-key prompt
++   --label-key ground_truth
++   # --tokenizer-type TikTokenizer
++   # --tiktoken-pattern v2
++   # --tokenizer-model /gemini/space/infra/wxe/Moonlight-16B-A3B/tokenizer_config.json
++   --apply-chat-template
++   # --rollout-shuffle
++   --rm-type deepscaler
++   --num-rollout 2
++   --rollout-batch-size 1
++   --n-samples-per-prompt 1
++   --rollout-max-response-len 7800
++   --rollout-temperature 0.8
++
++   --over-sampling-batch-size 1
++   # --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
++
++   --num-steps-per-rollout 1
++   --balance-data
++)
++
++EVAL_ARGS=(
++   --eval-interval 20
++   --eval-prompt-data dapo /afs/chatrl/users/wxe/slime/data/DAPO-Math-17k.jsonl
++   --n-samples-per-eval-prompt 8
++   --eval-max-response-len 4096
++   --eval-top-p 0.7
++)
++
++PERF_ARGS=(
++   --tensor-model-parallel-size 1
++   --sequence-parallel
++   --pipeline-model-parallel-size 1
++   --context-parallel-size 1
++   --expert-model-parallel-size 1
++   --expert-tensor-parallel-size 1
++   # --decoder-last-pipeline-num-layers 9
++   --recompute-granularity full
++   --recompute-method uniform
++   --recompute-num-layers 1
++
++   --use-dynamic-batch-size
++   --max-tokens-per-gpu 16384
++)
++
++GRPO_ARGS=(
++   --advantage-estimator grpo
++   --use-kl-loss
++   --kl-loss-coef 0.00
++   --kl-loss-type low_var_kl
++   --entropy-coef 0.00
++   --eps-clip 0.2
++   --eps-clip-high 0.28
++)
++
++OPTIMIZER_ARGS=(
++   --optimizer adam
++   --lr 1e-6
++   --lr-decay-style constant
++   --weight-decay 0.1
++   --adam-beta1 0.9
++   --adam-beta2 0.98
++   --num-layers 2
++   --moe-layer-freq "[0,1]"
++   --optimizer-cpu-offload
++   --overlap-cpu-optimizer-d2h-h2d
++   --use-precision-aware-optimizer
++)
++
++WANDB_ARGS=(
++   # --use-wandb
++   # --wandb-project slime-dev
++   # --wandb-group deepseek-r1-test
++   # --wandb-key ${WANDB_KEY}
++)
++
++SGLANG_ARGS=(
++   --rollout-num-gpus-per-engine 1
++   --sglang-mem-fraction-static 0.8
++
++   # dp attention
++   # --sglang-enable-dp-attention
++   --sglang-enable-tokenizer-batch-encode
++   --sglang-disable-cuda-graph
++   --sglang-dp-size 1
++   --sglang-tp-size 1
++   --sglang-ep-size 1
++   --sglang-moe-dense-tp-size 1
++   --sglang-enable-dp-lm-head
++   --sglang-disable-radix-cache
++   # --sglang-log-requests-level 3
++   # --sglang-log-requests
++   # --sglang-moe-a2a-backend deepep
++   --sglang-enable-nan-detection
++
++
++   # enable deepep for sglang
++   # --sglang-enable-deepep-moe
++   # --sglang-deepep-mode auto
++
++   # make every dp rank has 128 concurrency
++   --sglang-server-concurrency 1024
++)
++
++MISC_ARGS=(
++   # default dropout in megatron is 0.1
++   --attention-dropout 0.0
++   --hidden-dropout 0.0
++   # should be good for model performance
++   --accumulate-allreduce-grads-in-fp32
++   --attention-softmax-in-fp32
++   # --trust-remote-code
++   # need to comment this when using model with MLA
++   --attention-backend flash
++   # --debug-rollout-only
++
++
++   # use deepep for megatron
++   # --moe-enable-deepep
++   # --moe-token-dispatcher-type flex
++   # --use-routing-replay
++   # --debug-rollout-only
++)
++
++# launch the master node of ray in container
++export no_proxy="127.0.0.1,${GEMINI_HOST_IP_taskrole1_0}"
++ray start --head \
++    --node-ip-address "127.0.0.1" \
++    --num-gpus 1 \
++    --disable-usage-stats \
++    --dashboard-host=0.0.0.0 \
++    --dashboard-port=8265
++# if [ "$GEMINI_CURRENT_TASK_ROLE_CURRENT_TASK_INDEX" -eq 0 ]; then
++#     ray start --head \
++#         --node-ip-address "${GEMINI_HOST_IP_taskrole1_0}" \
++#         --num-gpus 8 \
++#         --disable-usage-stats \
++#         --dashboard-host=0.0.0.0 \
++#         --dashboard-port=8265
++# else
++#     ray start --address "${GEMINI_HOST_IP_taskrole1_0}:6379" --num-gpus 8 --disable-usage-stats
++# fi
++# if [ "$GEMINI_CURRENT_TASK_ROLE_CURRENT_TASK_INDEX" -eq 0 ]; then
++ray job submit --address="http://127.0.0.1:8265" \
++   --runtime-env-json='{
++   "env_vars": {
++      "no_proxy": "localhost,127.0.0.1,0.0.0.0",
++      "MASTER_ADDR": "127.0.0.1",
++      "PYTHONPATH": "/root/Megatron-LM/",
++      "CUDA_DEVICE_MAX_CONNECTIONS": "1",
++      "CUDA_LAUNCH_BLOCKING":"1",
++      "TORCH_SHOW_CPP_STACKTRACES":"1",
++      "TORCH_USE_CUDA_DSA":"1" ,
++      "LD_LIBRARY_PATH": "/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/sgl-workspace/nvshmem/install/lib/"
++   }
++   }' \
++   -- python3 train.py \
++   --actor-num-nodes 1 \
++   --actor-num-gpus-per-node 1 \
++   --colocate \
++   ${MODEL_ARGS[@]} \
++   ${CKPT_ARGS[@]} \
++   ${ROLLOUT_ARGS[@]} \
++   ${OPTIMIZER_ARGS[@]} \
++   ${GRPO_ARGS[@]} \
++   ${DISTRIBUTED_ARGS[@]} \
++   ${WANDB_ARGS[@]} \
++   ${PERF_ARGS[@]} \
++   ${EVAL_ARGS[@]} \
++   ${SGLANG_ARGS[@]} \
++   ${MISC_ARGS[@]}
++# fi
+\ No newline at end of file
+diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
+index afc6bef..e9a667e 100644
+--- a/slime/utils/arguments.py
++++ b/slime/utils/arguments.py
+@@ -1432,6 +1432,7 @@ def hf_validate_args(args, hf_config):
+         ("rope_theta", "rotary_base", equal),
+     ]:
+         if hasattr(hf_config, hf_config_name):
++            return 
+             assert compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)), (
+                 f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
+                 f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
+diff --git a/slime/utils/data.py b/slime/utils/data.py
+index 2d35fc8..15a15b2 100644
+--- a/slime/utils/data.py
++++ b/slime/utils/data.py
+@@ -104,7 +104,7 @@ class Dataset:
+             self.origin_samples.append(
+                 Sample(
+                     prompt=prompt,
+-                    label=data[label_key] if label_key is not None else None,
++                    label = data.get(label_key) if label_key is not None else None,
+                     metadata=data.get(metadata_key) or {},
+                 )
+             )
+diff --git a/slime/utils/rollout_routing_replay.py b/slime/utils/rollout_routing_replay.py
+new file mode 100644
+index 0000000..c915c25
+--- /dev/null
++++ b/slime/utils/rollout_routing_replay.py
+@@ -0,0 +1,168 @@
++import os  
++import hashlib  
++import requests  
++import torch  
++from typing import Optional, Tuple, List  
++  
++ROLLOUT_ROUTING_REPLAY_CACHE = None  
++  
++  
++def set_r3_cache(cache):  
++    global ROLLOUT_ROUTING_REPLAY_CACHE  
++    ROLLOUT_ROUTING_REPLAY_CACHE = cache  
++  
++  
++class RolloutRoutingReplayCache:  
++    all_routing_cache = []  
++  
++    def __init__(self, cache_server_url="http://0.0.0.0:8000"):  
++        self.cache_server_url = cache_server_url  
++        self.token_ids = None  
++        self.layer_number = None  
++        self.config = None  
++        RolloutRoutingReplayCache.all_routing_cache.append(self)  
++  
++    def set_token_ids(self, 
++                      token_ids: List[int]):  
++        self.token_ids = token_ids  
++  
++    def _compute_hash_key(self, 
++                          token_ids: List[int], 
++                          prior_hash: Optional[str] = None) -> str:  
++        hasher = hashlib.sha256()  
++        if prior_hash:  
++            hasher.update(bytes.fromhex(prior_hash))  
++          
++        for t in token_ids:  
++            hasher.update(int(t).to_bytes(4, byteorder="little", signed=False))  
++          
++        return hasher.hexdigest()  
++  
++    def query_cache(self, 
++                    layer_number: int, 
++                    config) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:  
++        if self.token_ids is None:  
++            return None, None  
++          
++        self.layer_number = layer_number  
++        self.config = config  
++          
++        last_hash = None  
++        hash_keys = []  
++        for token_id in self.token_ids:  
++            last_hash = self._compute_hash_key([token_id], prior_hash=last_hash)  
++            hash_keys.append(last_hash)  
++          
++        try:  
++            response = requests.post(  
++                f"{self.cache_server_url}/batch_get",  
++                json={"keys": hash_keys},  
++                timeout=5  
++            )  
++                
++            data_list = response.json().get("data", [])                
++            if not data_list:
++                return None, None
++                
++            valid_count = sum(1 for data in data_list if data is not None)
++            if valid_count == 0:
++                return None, None
++                
++            template_data = next((data for data in data_list if data is not None), None)
++            if template_data is None:
++                return None, None
++                
++            num_tokens = len(data_list)
++            half_len = len(template_data) // 2
++            num_layers = half_len // config.moe_router_topk
++            layer_idx = min(layer_number - 1, num_layers - 1)
++            
++            layer_weights = torch.empty(
++                (num_tokens, config.moe_router_topk),
++                dtype=torch.float32,
++                device=torch.cuda.current_device()
++            )
++            
++            layer_ids = torch.empty(
++                (num_tokens, config.moe_router_topk),
++                dtype=torch.int64,
++                device=torch.cuda.current_device()
++            )
++            
++            for i, data in enumerate(data_list):
++                if data is None:
++                    data = template_data
++                    
++                if len(data) != len(template_data):
++                    data = template_data
++                    
++                start_idx = layer_idx * config.moe_router_topk
++                end_idx = start_idx + config.moe_router_topk
++                weights_start = half_len + start_idx
++                weights_end = half_len + end_idx
++                
++                layer_ids[i] = torch.tensor(
++                    data[start_idx:end_idx],
++                    dtype=torch.int64,
++                    device=layer_ids.device
++                )
++                
++                layer_weights[i] = torch.tensor(
++                    data[weights_start:weights_end],
++                    dtype=torch.float32,
++                    device=layer_weights.device
++                )
++            
++            # 调试信息
++            # print(f"Token ids: {self.token_ids}")
++            # print(f"Len {len(self.token_ids)}")
++            # print(f"✅ R3 Cache hit for layer {layer_number}")
++            # print(f"   Shape: {layer_weights.shape}")
++            # print(f"   Tokens: {num_tokens}")
++            # print(f"   Cache hit rate: {valid_count}/{num_tokens} ({valid_count/num_tokens*100:.1f}%)")
++        
++            return layer_weights, layer_ids 
++              
++        except Exception as e:  
++            print(f"Error querying R3 routing cache: {e}")  
++            return None, None  
++  
++    @staticmethod  
++    def clear_all():  
++        for cache in RolloutRoutingReplayCache.all_routing_cache:  
++            cache.token_ids = None  
++  
++  
++def get_r3_cache_compute_topk(old_compute_topk):  
++    def compute_topk(scores, topk, num_groups=None, group_topk=None):  
++        import os  
++        if os.environ.get("ENABLE_R3_CACHE", "1") == "1":  
++            if ROLLOUT_ROUTING_REPLAY_CACHE is not None:  
++                cached_probs, cached_top_indices = ROLLOUT_ROUTING_REPLAY_CACHE.query_cache(  
++                    layer_number=getattr(ROLLOUT_ROUTING_REPLAY_CACHE, 'current_layer', 0),  
++                    config=getattr(ROLLOUT_ROUTING_REPLAY_CACHE, 'config', None)  
++                )  
++                if cached_probs is not None and cached_top_indices is not None:  
++                    # print(f"✅ R3 Cache hit for layer {ROLLOUT_ROUTING_REPLAY_CACHE.current_layer}")  
++                    return cached_probs, cached_top_indices  
++
++        
++        return old_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)  
++      
++    return compute_topk  
++  
++  
++def register_r3_cache(module, cache_server_url="http://0.0.0.0:8000"):  
++    if os.environ.get("ENABLE_R3_CACHE", "1") == "1":  
++        module.r3_cache = RolloutRoutingReplayCache(cache_server_url)  
++  
++        def pre_forward_hook(module, input):  
++            set_r3_cache(module.r3_cache)  
++            from megatron.core.moe.cache_context import MoECacheContext  
++            token_ids = MoECacheContext.get_input_ids()  
++            if token_ids is not None:  
++                module.r3_cache.set_token_ids(token_ids)  
++            module.r3_cache.current_layer = module.layer_number  
++            module.r3_cache.config = module.config  
++  
++        module.register_forward_pre_hook(pre_forward_hook)
+\ No newline at end of file

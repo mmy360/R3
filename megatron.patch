@@ -222,195 +222,33 @@ index 000000000..3300d6738
 +        cls._thread_local.input_ids = None
 \ No newline at end of file
 diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
-index fbcffe278..383d083e8 100644
+index fbcffe278..74c038864 100644
 --- a/megatron/core/transformer/moe/moe_utils.py
 +++ b/megatron/core/transformer/moe/moe_utils.py
-@@ -566,8 +566,8 @@ def topk_routing_with_score_function(
-         else:
-             return torch.topk(scores, k=topk, dim=1)
+@@ -569,6 +569,9 @@ def topk_routing_with_score_function(
+     from slime.utils.routing_replay import get_routing_replay_compute_topk
+     compute_topk = get_routing_replay_compute_topk(compute_topk)
  
--    from slime.utils.routing_replay import get_routing_replay_compute_topk
--    compute_topk = get_routing_replay_compute_topk(compute_topk)
-+    # from slime.utils.routing_replay import get_routing_replay_compute_topk
-+    # compute_topk = get_routing_replay_compute_topk(compute_topk)
- 
++    from slime.utils.rollout_routing_replay import get_r3_cache_compute_topk  
++    compute_topk = get_r3_cache_compute_topk(compute_topk)  
++
      if score_function == "softmax":
          if use_pre_softmax:
+             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
 diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
-index 459e65921..f1cf2d310 100644
+index 459e65921..a7586d973 100644
 --- a/megatron/core/transformer/moe/router.py
 +++ b/megatron/core/transformer/moe/router.py
-@@ -1,8 +1,10 @@
- # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+@@ -159,6 +159,9 @@ class TopKRouter(Router):
+         from slime.utils.routing_replay import register_routing_replay
+         register_routing_replay(self)
  
- from abc import ABC, abstractmethod
--from typing import Optional
-+import hashlib
-+from typing import Optional, Tuple
- 
-+import requests
- import torch
- 
- from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
-@@ -21,7 +23,7 @@ from megatron.core.transformer.moe.moe_utils import (
-     z_loss_func,
- )
- from megatron.core.transformer.transformer_config import TransformerConfig
--
-+from megatron.core.moe.cache_context import MoECacheContext 
- 
- class Router(ABC, MegatronModule):
-     """Base Router class"""
-@@ -44,7 +46,6 @@ class Router(ABC, MegatronModule):
-         self.tp_group = model_comm_pgs.tp
-         self.cp_group = model_comm_pgs.cp
-         self.tp_cp_group = model_comm_pgs.tp_cp
--
-         # Initialize the gate weights.
-         # TODO: Add support for GPU initialization, which requires updating the golden values.
-         self.weight = torch.nn.Parameter(
-@@ -155,9 +156,8 @@ class TopKRouter(Router):
-         else:
-             self.local_tokens_per_expert = None
-             self.expert_bias = None
--
--        from slime.utils.routing_replay import register_routing_replay
--        register_routing_replay(self)
-+        # from slime.utils.routing_replay import register_routing_replay
-+        # register_routing_replay(self)
- 
++        from slime.utils.rollout_routing_replay import register_r3_cache  
++        register_r3_cache(self, cache_server_url="http://0.0.0.0:8000")        
++
      def _maintain_float32_expert_bias(self):
          """
-@@ -453,26 +453,100 @@ class TopKRouter(Router):
-         return probs, routing_map
- 
-     def forward(self, input: torch.Tensor):
--        """
--        Forward pass of the router.
--
--        Args:
--            input (torch.Tensor): Input tensor.
--        """
-         self._maintain_float32_expert_bias()
-+        self.token_ids = MoECacheContext.get_input_ids()    
- 
--        # Apply input jitter
-         input = self.apply_input_jitter(input)
-         logits = self.gating(input)
- 
-         if self.config.moe_router_force_load_balancing:
--            # Apply force load balancing with random logits for benchmark
-             logits = apply_random_logits(logits)
- 
--        probs, routing_map = self.routing(logits)
--
-+        probs,routing_map = self.query_routing_cache(self.token_ids)
-+        if probs is None and routing_map is None:
-+            probs, routing_map = self.routing(logits)
-+            print(f"Cached missed: len probs: {len(probs)} len routing map {len(routing_map)}")
-+        else:
-+            print(f"Cached hit: len probs: {len(probs)} len routing map {len(routing_map)}")
-+            probs, routing_map =self.extract_routing_cache(probs, routing_map)
-         return probs, routing_map
- 
-+    def extract_routing_cache(  
-+        self, 
-+        topk_weights_list,  
-+        topk_ids_list,    
-+    ):  
-+        num_tokens = len(topk_weights_list)          
-+        probs_dense = torch.zeros(  
-+            (num_tokens, self.config.num_moe_experts),  
-+            dtype=torch.float32,  
-+            device=torch.cuda.current_device()    
-+        )  
-+        routing_map_dense = torch.zeros(  
-+            (num_tokens, self.config.num_moe_experts),  
-+            dtype=torch.bool,  
-+            device=torch.cuda.current_device()    
-+        )  
-+        
-+        for token_idx in range(num_tokens):  
-+            if topk_weights_list[token_idx] is not None:
-+                layer_weights = topk_weights_list[token_idx][self.layer_number - 1]  
-+                layer_ids = topk_ids_list[token_idx][self.layer_number - 1]  
-+                probs_dense[token_idx].scatter_(  
-+                    dim=0,  
-+                    index=layer_ids.long(),     
-+                    src=layer_weights.float()         
-+                )  
-+                routing_map_dense[token_idx].scatter_(  
-+                    dim=0,  
-+                    index=layer_ids.long(),
-+                    value=True  
-+                )  
-+        print(f"✅ routing_map_dense sum: {routing_map_dense.sum()}")
-+        print(f"✅ Expected: {num_tokens} * {self.config.moe_router_topk} = {num_tokens * self.config.moe_router_topk}")
-+        return probs_dense, routing_map_dense
-+
-+    def query_routing_cache(      
-+        self,       
-+        token_ids: torch.Tensor,      
-+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:      
-+
-+        last_hash = None    
-+        hash_keys = []
-+        for i in range(len(token_ids)):    
-+            last_hash = self._compute_hash_key([token_ids[i]], prior_hash=last_hash)    
-+            hash_keys.append(last_hash)
-+
-+        try:
-+            response = requests.post(        
-+                f"http://0.0.0.0:8000/batch_get",        
-+                json={"keys": hash_keys}, 
-+                timeout=5      
-+            )         
-+            data_list = response.json()["data"]        
-+            all_topk_ids = []  
-+            all_topk_weights = []   
-+                       
-+            for data in data_list:  
-+                if data is None:
-+                    if data_list[0] is None:
-+                        return None, None
-+                    else:
-+                        dummy_topk_ids = torch.tensor(data_list[0][:len(data_list[0])//2], dtype=torch.int64, device=torch.cuda.current_device()).reshape(-1, self.config.moe_router_topk)
-+                        dummy_topk_weights =  torch.tensor(data_list[0][len(data_list[0])//2:], dtype=torch.float32, device=torch.cuda.current_device()).reshape(-1, self.config.moe_router_topk)
-+                        all_topk_ids.append(dummy_topk_ids)  
-+                        all_topk_weights.append(dummy_topk_weights)
-+                else:
-+                    topk_ids = torch.tensor(data[:len(data)//2], dtype=torch.int64, device=torch.cuda.current_device()).reshape(-1, self.config.moe_router_topk)
-+                    topk_weights = torch.tensor(data[len(data)//2:], dtype=torch.float32, device=torch.cuda.current_device()).reshape(-1, self.config.moe_router_topk)
-+                    all_topk_ids.append(topk_ids)  
-+                    all_topk_weights.append(topk_weights)  
-+            return all_topk_weights, all_topk_ids
-+            
-+        except Exception as e:    
-+            print(f"Error querying routing cache: {e}")    
-+            return None, None
-+        
-     def _load_from_state_dict(self, *args, **kwargs):
-         """Load the state dict of the router."""
-         self._maintain_float32_expert_bias()  # switch to float32 before loading
-@@ -482,3 +556,18 @@ class TopKRouter(Router):
-         """Save the state dict of the router."""
-         self._maintain_float32_expert_bias()  # switch to float32 before saving
-         return super()._save_to_state_dict(*args, **kwargs)
-+
-+    def _compute_hash_key(self, token_ids: torch.Tensor, prior_hash: Optional[str] = None) -> str:    
-+        hasher = hashlib.sha256()    
-+        if prior_hash:  
-+            hasher.update(bytes.fromhex(prior_hash))  
-+        
-+        for t in token_ids:    
-+            if isinstance(t, tuple):  
-+                for elem in t:  
-+                    hasher.update(int(elem).to_bytes(4, byteorder="little", signed=False))  
-+            else:  
-+                hasher.update(int(t).to_bytes(4, byteorder="little", signed=False))    
-+        
-+        return hasher.hexdigest()    
-+    
+         Maintain the expert bias in float32.
 diff --git a/megatron/training/checkpointing.py b/megatron/training/checkpointing.py
 index c15c05196..812dbf437 100644
 --- a/megatron/training/checkpointing.py

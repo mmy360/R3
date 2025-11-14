@@ -675,10 +675,10 @@ index 6ea4e1b..df44c31 100644
 +        self.dec_lock_ref(req.moe_last_node)
 +        self.check_hicache_events()
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index 975c727..61fc953 100644
+index 975c727..c562a13 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
-@@ -1918,3 +1918,138 @@ def copy_all_layer_kv_cache_tiled(
+@@ -1918,3 +1918,153 @@ def copy_all_layer_kv_cache_tiled(
      mask = mask_loc[:, None] & mask_byte[None, :]
      vals = tl.load(src_ptr, mask=mask)
      tl.store(tgt_ptr, vals, mask=mask)
@@ -697,6 +697,7 @@ index 975c727..61fc953 100644
 +        enable_memory_saver: bool,  
 +        start_layer: Optional[int] = None,  
 +        end_layer: Optional[int] = None,  
++        enable_alt_stream: bool = True,
 +    ):  
 +        super().__init__(  
 +            size,  
@@ -709,12 +710,14 @@ index 975c727..61fc953 100644
 +            end_layer,  
 +        )  
 +        self.num_experts_per_tok = num_experts_per_tok  
-+          
-+        # 添加统计变量  
-+        self.num_writes = 0  # 总写入次数  
-+        self.total_tokens_written = 0  # 总写入的 token 数  
-+          
++        self.num_writes = 0 
++        self.total_tokens_written = 0 
 +        self._create_buffers()  
++        
++        self.device_module = torch.get_device_module(self.device)  
++        self.alt_stream = (  
++            self.device_module.Stream() if _is_cuda and enable_alt_stream else None  
++        )
 +        self._finalize_allocation_log(size)  
 +      
 +    def _create_buffers(self):  
@@ -753,20 +756,32 @@ index 975c727..61fc953 100644
 +            self.routing_weights_buffer[layer_id - self.start_layer],  
 +        )  
 +      
-+    def set_kv_buffer(  
-+        self,  
-+        layer_id,  
-+        loc: torch.Tensor,  
-+        cache_expert_indices: torch.Tensor,  
-+        cache_routing_weights: torch.Tensor,  
-+    ):  
-+        layer_id = layer_id  
-+        if cache_expert_indices.dtype != torch.int32:  
-+            cache_expert_indices = cache_expert_indices.to(torch.int32)  
-+        if cache_routing_weights.dtype != self.dtype:  
-+            cache_routing_weights = cache_routing_weights.to(self.dtype)  
-+        self.expert_indices_buffer[layer_id - self.start_layer][loc] = cache_expert_indices  
-+        self.routing_weights_buffer[layer_id - self.start_layer][loc] = cache_routing_weights  
++    def set_kv_buffer(    
++        self,    
++        layer_id: int,    
++        loc: torch.Tensor,    
++        cache_expert_indices: torch.Tensor,    
++        cache_routing_weights: torch.Tensor,    
++    ):    
++        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode    
++          
++        if cache_expert_indices.dtype != torch.int32:    
++            cache_expert_indices = cache_expert_indices.to(torch.int32)    
++        if cache_routing_weights.dtype != self.dtype:    
++            cache_routing_weights = cache_routing_weights.to(self.dtype)    
++          
++        layer_idx = layer_id - self.start_layer    
++          
++        if get_is_capture_mode() and self.alt_stream is not None:    
++            current_stream = self.device_module.current_stream()    
++            self.alt_stream.wait_stream(current_stream)    
++            self.expert_indices_buffer[layer_idx][loc] = cache_expert_indices    
++            with self.device_module.stream(self.alt_stream):    
++                self.routing_weights_buffer[layer_idx][loc] = cache_routing_weights    
++            current_stream.wait_stream(self.alt_stream)    
++        else:    
++            self.expert_indices_buffer[layer_idx][loc] = cache_expert_indices    
++            self.routing_weights_buffer[layer_idx][loc] = cache_routing_weights
 +      
 +    def get_kv_size_bytes(self):  
 +        indices_size = sum(  
@@ -1575,7 +1590,7 @@ index 34afad0..0027673 100644
              f"Memory pool end. "
              f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index 6faa408..6489b91 100644
+index 6faa408..e8e7e90 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
 @@ -698,6 +698,16 @@ class DeepseekV2MoE(nn.Module):
@@ -1585,7 +1600,7 @@ index 6faa408..6489b91 100644
 +        router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
 +        topk_output = self.topk(hidden_states, router_logits)
 +        # logger.info(f"{topk_output.topk_ids}")
-+        if forward_batch is not None:          
++        if forward_batch is not None and forward_batch.moe_routing_cache is not None :          
 +            forward_batch.moe_routing_cache.set_kv_buffer(  
 +                layer_id=self.layer_id,  
 +                loc=forward_batch.moe_routing_cache_loc,  
