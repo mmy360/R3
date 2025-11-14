@@ -675,7 +675,7 @@ index 6ea4e1b..df44c31 100644
 +        self.dec_lock_ref(req.moe_last_node)
 +        self.check_hicache_events()
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index 975c727..c562a13 100644
+findex 975c727..c562a13 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -1918,3 +1918,153 @@ def copy_all_layer_kv_cache_tiled(

@@ -1,6 +1,6 @@
 diff --git a/scripts/run-moonlight.sh b/scripts/run-moonlight.sh
 new file mode 100755
-index 0000000..50d7be0
+index 0000000..e716693
 --- /dev/null
 +++ b/scripts/run-moonlight.sh
 @@ -0,0 +1,213 @@
@@ -128,7 +128,7 @@ index 0000000..50d7be0
 +   # dp attention
 +   # --sglang-enable-dp-attention
 +   --sglang-enable-tokenizer-batch-encode
-+   --sglang-disable-cuda-graph
++   # --sglang-disable-cuda-graph
 +   --sglang-dp-size 1
 +   --sglang-tp-size 1
 +   --sglang-ep-size 1
@@ -245,10 +245,10 @@ index 2d35fc8..15a15b2 100644
              )
 diff --git a/slime/utils/rollout_routing_replay.py b/slime/utils/rollout_routing_replay.py
 new file mode 100644
-index 0000000..c915c25
+index 0000000..b978881
 --- /dev/null
 +++ b/slime/utils/rollout_routing_replay.py
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,138 @@
 +import os  
 +import hashlib  
 +import requests  
@@ -326,54 +326,23 @@ index 0000000..c915c25
 +            num_tokens = len(data_list)
 +            half_len = len(template_data) // 2
 +            num_layers = half_len // config.moe_router_topk
-+            layer_idx = min(layer_number - 1, num_layers - 1)
++            layer_idx = layer_number - 1
 +            
-+            layer_weights = torch.empty(
-+                (num_tokens, config.moe_router_topk),
-+                dtype=torch.float32,
-+                device=torch.cuda.current_device()
-+            )
-+            
-+            layer_ids = torch.empty(
-+                (num_tokens, config.moe_router_topk),
-+                dtype=torch.int64,
-+                device=torch.cuda.current_device()
-+            )
++            layer_weights = torch.empty((num_tokens, config.moe_router_topk), dtype=torch.float32, device=torch.cuda.current_device())
++            layer_ids = torch.empty((num_tokens, config.moe_router_topk), dtype=torch.int64, device=torch.cuda.current_device())
 +            
 +            for i, data in enumerate(data_list):
-+                if data is None:
++                if data is None or set(data) == {0}:
 +                    data = template_data
-+                    
-+                if len(data) != len(template_data):
-+                    data = template_data
-+                    
 +                start_idx = layer_idx * config.moe_router_topk
 +                end_idx = start_idx + config.moe_router_topk
 +                weights_start = half_len + start_idx
 +                weights_end = half_len + end_idx
 +                
-+                layer_ids[i] = torch.tensor(
-+                    data[start_idx:end_idx],
-+                    dtype=torch.int64,
-+                    device=layer_ids.device
-+                )
-+                
-+                layer_weights[i] = torch.tensor(
-+                    data[weights_start:weights_end],
-+                    dtype=torch.float32,
-+                    device=layer_weights.device
-+                )
-+            
-+            # 调试信息
-+            # print(f"Token ids: {self.token_ids}")
-+            # print(f"Len {len(self.token_ids)}")
-+            # print(f"✅ R3 Cache hit for layer {layer_number}")
-+            # print(f"   Shape: {layer_weights.shape}")
-+            # print(f"   Tokens: {num_tokens}")
-+            # print(f"   Cache hit rate: {valid_count}/{num_tokens} ({valid_count/num_tokens*100:.1f}%)")
++                layer_ids[i] = torch.tensor(data[start_idx:end_idx], dtype=torch.int64, device=layer_ids.device)
++                layer_weights[i] = torch.tensor(data[weights_start:weights_end], dtype=torch.float32, device=layer_weights.device)
 +        
 +            return layer_weights, layer_ids 
-+              
 +        except Exception as e:  
 +            print(f"Error querying R3 routing cache: {e}")  
 +            return None, None  
@@ -394,7 +363,8 @@ index 0000000..c915c25
 +                    config=getattr(ROLLOUT_ROUTING_REPLAY_CACHE, 'config', None)  
 +                )  
 +                if cached_probs is not None and cached_top_indices is not None:  
-+                    # print(f"✅ R3 Cache hit for layer {ROLLOUT_ROUTING_REPLAY_CACHE.current_layer}")  
++                    a,b = old_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk) 
++                    print(f"✅ R3 Cache hit for layer {ROLLOUT_ROUTING_REPLAY_CACHE.current_layer}")  
 +                    return cached_probs, cached_top_indices  
 +
 +        
