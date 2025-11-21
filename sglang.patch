@@ -1,16 +1,8 @@
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index be2de0c..0481660 100644
+index b7e24cf..dae2c78 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -75,6 +75,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
- from sglang.srt.sampling.sampling_params import SamplingParams
- from sglang.srt.server_args import ServerArgs, get_global_server_args
- from sglang.srt.utils import flatten_nested_list
-+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MoEReqToTokenPool, ReqToTokenPool
- 
- if TYPE_CHECKING:
-     from sglang.srt.configs.model_config import ModelConfig
-@@ -486,6 +487,7 @@ class Req:
+@@ -517,6 +517,7 @@ class Req:
  
          # Memory pool info
          self.req_pool_idx: Optional[int] = None
@@ -18,7 +10,7 @@ index be2de0c..0481660 100644
          self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
  
          # Check finish
-@@ -530,12 +532,17 @@ class Req:
+@@ -560,12 +561,17 @@ class Req:
          self.extend_logprob_start_len = 0
          self.last_node: Any = None
          self.last_host_node: Any = None
@@ -37,7 +29,7 @@ index be2de0c..0481660 100644
          # Whether or not if it is chunked. It increments whenever
          # it is chunked, and decrement whenever chunked request is
          # processed.
-@@ -685,7 +692,10 @@ class Req:
+@@ -754,7 +760,10 @@ class Req:
          # Whether request reached finished condition
          return self.finished_reason is not None
  
@@ -49,7 +41,7 @@ index be2de0c..0481660 100644
          self.fill_ids = self.origin_input_ids + self.output_ids
          input_len = len(self.fill_ids)
          # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
-@@ -710,6 +720,16 @@ class Req:
+@@ -779,6 +788,16 @@ class Req:
                  ),
              )
              self.last_matched_prefix_len = len(self.prefix_indices)
@@ -66,18 +58,17 @@ index be2de0c..0481660 100644
          self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
  
      # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
-@@ -876,7 +896,9 @@ class Req:
+@@ -948,6 +967,9 @@ class Req:
+         self.retraction_count += 1
  
-     def reset_for_retract(self):
          self.prefix_indices = torch.empty((0,), dtype=torch.int64)
--        self.last_node = None
 +        self.moe_prefix_indices = torch.empty((0,), dtype=torch.int64)
 +        self.moe_last_node= None
-+        self.last_node = None   
++        self.last_node = None                   
+         self.routed_experts = []
+         self.last_node = None
          self.swa_uuid_for_lock = None
-         self.extend_input_len = 0
-         self.is_retracted = True
-@@ -940,8 +962,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1017,8 +1039,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
      # Request, memory pool, and cache
      reqs: List[Req]
      req_to_token_pool: ReqToTokenPool = None
@@ -89,7 +80,7 @@ index be2de0c..0481660 100644
      is_hybrid: bool = False
  
      # Batch configs
-@@ -968,6 +993,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1045,6 +1070,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
      seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
      # The output locations of the KV cache
      out_cache_loc: torch.Tensor = None  # shape: [b], int64
@@ -97,21 +88,21 @@ index be2de0c..0481660 100644
      output_ids: torch.Tensor = None  # shape: [b], int64
  
      # For multimodal inputs
-@@ -999,6 +1025,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1077,6 +1103,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
      prefix_lens: List[int] = None
      extend_lens: List[int] = None
      extend_num_tokens: Optional[int] = None
-+    moe_prefix_lens: List[int] = None  # MoE routing cache 的 prefix 长度  
-+    moe_extend_lens: List[int] = None  # MoE routing cache 的 extend 长度  
-+    moe_extend_num_tokens: Optional[int] = None  # MoE 需要分配的总 token 数    
++    moe_prefix_lens: List[int] = None
++    moe_extend_lens: List[int] = None
++    moe_extend_num_tokens: Optional[int] = None
      decoding_reqs: List[Req] = None
      extend_logprob_start_lens: List[int] = None
      # It comes empty list if logprob is not required.
-@@ -1038,8 +1067,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1132,8 +1161,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
          cls,
          reqs: List[Req],
          req_to_token_pool: ReqToTokenPool,
-+        moe_req_to_token_pool: MoEReqToTokenPool,
++        moe_req_to_token_pool: ReqToTokenPool,
          token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 +        moe_token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
          tree_cache: BasePrefixCache,
@@ -119,7 +110,7 @@ index be2de0c..0481660 100644
          model_config: ModelConfig,
          enable_overlap: bool,
          spec_algorithm: SpeculativeAlgorithm,
-@@ -1059,8 +1091,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1153,8 +1185,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
          return cls(
              reqs=reqs,
              req_to_token_pool=req_to_token_pool,
@@ -131,26 +122,48 @@ index be2de0c..0481660 100644
              is_hybrid=is_hybrid,
              model_config=model_config,
              enable_overlap=enable_overlap,
-@@ -1193,8 +1228,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1297,9 +1332,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
          self.seq_lens = seq_lens_tensor
          self.seq_lens_cpu = seq_lens_cpu
          self.extend_num_tokens = extend_num_tokens
 -
 -        # Allocate memory
+-        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
 +        self.moe_prefix_lens = [len(r.moe_prefix_indices) for r in reqs]  
 +        self.moe_extend_lens = [  
 +            len(r.fill_ids) - self.moe_prefix_lens[i]   
 +            for i, r in enumerate(reqs)  
 +        ]  
 +        self.moe_extend_num_tokens = sum(self.moe_extend_lens) 
-         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
++        out_cache_loc, moe_out_cache_loc, req_pool_indices_tensor, moe_req_pool_indices_tensor, req_pool_indices, moe_req_pool_indices = alloc_for_extend(
              self
          )
-@@ -1476,9 +1515,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+ 
+@@ -1310,6 +1349,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+ 
+         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
+             req.req_pool_idx = req_pool_indices[i]
++            req.moe_req_pool_idx = moe_req_pool_indices[i]
+             assert seq_len - pre_len == req.extend_input_len
+ 
+             # update req-level memory management fields
+@@ -1407,8 +1447,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+ 
+         self.input_ids = input_ids_tensor
+         self.req_pool_indices = req_pool_indices_tensor
++        self.moe_req_pool_indices = moe_req_pool_indices_tensor
+         self.orig_seq_lens = orig_seq_lens_tensor
+         self.out_cache_loc = out_cache_loc
++        self.moe_out_cache_loc = moe_out_cache_loc
+         self.input_embeds = (
+             torch.tensor(input_embeds).to(self.device, non_blocking=True)
+             if input_embeds
+@@ -1590,10 +1632,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+                 self.req_to_token_pool, self.token_to_kv_pool_allocator
              )
          # TODO (csy): for preempted requests, we may want to insert into the tree
-         self.tree_cache.cache_finished_req(req, is_insert=False)
-+        self.moe_tree_cache.cache_finished_req(req, is_insert=False)
+-        release_kv_cache(req, self.tree_cache, is_insert=False)
++        release_kv_cache(req, self.tree_cache, self.moe_tree_cache, is_insert=False)
          # NOTE(lsyin): we should use the newly evictable memory instantly.
          num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
          evict_from_tree_cache(self.tree_cache, num_tokens)
@@ -158,21 +171,43 @@ index be2de0c..0481660 100644
  
          req.reset_for_retract()
  
-@@ -1714,6 +1755,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1609,6 +1652,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
+         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
++        self.moe_out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)  
++        self.moe_req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)  
++        self.moe_extend_num_tokens = 0      
+         self.seq_lens_sum = 0
+         self.extend_num_tokens = 0
+         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+@@ -1666,7 +1712,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             self.prepare_encoder_info_decode()
+ 
+         # Allocate memory
+-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
++        self.out_cache_loc, self.moe_out_cache_loc = alloc_for_decode(self, token_per_req=1)
+ 
+         # Update req-level memory management fields
+         for req in self.reqs:
+@@ -1834,6 +1880,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
              seq_lens=self.seq_lens,
              orig_seq_lens=self.orig_seq_lens,
              out_cache_loc=self.out_cache_loc,
-+            moe_routing_cache_loc=self.moe_routing_cache_loc,
++            moe_out_cache_loc=self.moe_out_cache_loc,
              seq_lens_cpu=seq_lens_cpu,
              seq_lens_sum=self.seq_lens_sum,
              return_logprob=self.return_logprob,
-@@ -1864,3 +1906,4 @@ class ModelWorkerBatch:
- 
-     # Whether this batch is prefill-only (no token generation needed)
-     is_prefill_only: bool = False
-+    moe_routing_cache_loc: Optional[torch.Tensor] = None
+@@ -1927,6 +1974,7 @@ class ModelWorkerBatch:
+     seq_lens: torch.Tensor
+     # The indices of output tokens in the token_to_kv_pool_allocator
+     out_cache_loc: torch.Tensor
++    moe_out_cache_loc: torch.Tensor
+     # The sequence length tensor on CPU
+     seq_lens_cpu: Optional[torch.Tensor]
+     seq_lens_sum: int
 diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
-index 9a43121..bc9fcc4 100644
+index 9a43121..314f05f 100644
 --- a/python/sglang/srt/managers/schedule_policy.py
 +++ b/python/sglang/srt/managers/schedule_policy.py
 @@ -83,12 +83,14 @@ class SchedulePolicy:
@@ -190,35 +225,20 @@ index 9a43121..bc9fcc4 100644
          self.enable_hierarchical_cache = enable_hierarchical_cache
          self.enable_priority_scheduling = enable_priority_scheduling
          self.schedule_low_priority_values_first = schedule_low_priority_values_first
-@@ -210,6 +212,11 @@ class SchedulePolicy:
-                         RadixKey(token_ids=prefix_ids, extra_key=extra_key),
-                         torch.empty(len(prefix_ids), dtype=torch.bool),
-                     )
-+            r.moe_prefix_indices, r.moe_last_node, r.moe_last_host_node, r.moe_host_hit_length = (
-+                self.moe_tree_cache.match_prefix(  
-+                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)  
-+                )  
-+            )
-         return temporary_deprioritized
- 
-     @staticmethod
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 4346b0d..3d6b876 100644
+index dd9f613..affdae0 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -147,9 +147,9 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
- from sglang.srt.managers.session_controller import Session
+@@ -150,7 +150,7 @@ from sglang.srt.managers.session_controller import Session
  from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
  from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
+ from sglang.srt.mem_cache.common import release_kv_cache
 -from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 +from sglang.srt.mem_cache.hiradix_cache import HiRadixCache, MoEHiRadixCache
  from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
--from sglang.srt.mem_cache.radix_cache import RadixCache
-+from sglang.srt.mem_cache.radix_cache import MoERadixCache, RadixCache
+ from sglang.srt.mem_cache.radix_cache import RadixCache
  from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
- from sglang.srt.parser.reasoning_parser import ReasoningParser
- from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
-@@ -438,6 +438,7 @@ class Scheduler(
+@@ -471,6 +471,7 @@ class Scheduler(
          self.policy = SchedulePolicy(
              self.schedule_policy,
              self.tree_cache,
@@ -226,7 +246,7 @@ index 4346b0d..3d6b876 100644
              self.enable_hierarchical_cache,
              self.enable_priority_scheduling,
              self.schedule_low_priority_values_first,
-@@ -712,7 +713,7 @@ class Scheduler(
+@@ -695,7 +696,7 @@ class Scheduler(
      def init_memory_pool_and_cache(self):
          server_args = self.server_args
  
@@ -235,37 +255,31 @@ index 4346b0d..3d6b876 100644
              self.tp_worker.get_memory_pool()
          )
  
-@@ -847,6 +848,29 @@ class Scheduler(
+@@ -835,6 +836,23 @@ class Scheduler(
  
          embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
-         init_embedding_cache(embedding_cache_size * 1024 * 1024)
-+        
-+        if True:  
-+            self.moe_tree_cache = MoEHiRadixCache(  
-+                req_to_token_pool=self.moe_req_to_token_pool,  
-+                token_to_kv_pool_allocator=self.moe_token_to_kv_pool_allocator,  
-+                tp_cache_group=self.tp_cpu_group,  
-+                page_size=self.page_size,  
-+                hicache_ratio=server_args.hicache_ratio,  
-+                hicache_size=server_args.hicache_size,  
-+                hicache_write_policy="write_through",  
-+                hicache_io_backend=server_args.hicache_io_backend,  
-+                hicache_mem_layout=server_args.hicache_mem_layout,  
-+                enable_metrics=self.enable_metrics,  
-+                hicache_storage_backend="http",  
-+                disable=server_args.disable_radix_cache,  
-+            )  
-+        else:  
-+            self.moe_tree_cache = MoERadixCache(  
-+                req_to_token_pool=self.moe_req_to_token_pool,  
-+                token_to_kv_pool_allocator=self.moe_token_to_kv_pool_allocator,  
-+                page_size=self.page_size,  
-+                disable=server_args.disable_radix_cache,  
-+            )
+         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
++        self.moe_tree_cache = MoEHiRadixCache(  
++            req_to_token_pool=self.moe_req_to_token_pool,  
++            token_to_kv_pool_allocator=self.moe_token_to_kv_pool_allocator,  
++            tp_cache_group=(
++                self.attn_tp_cpu_group
++                if self.server_args.enable_dp_attention
++                else self.tp_cpu_group
++            ),
++            page_size=self.page_size,  
++            hicache_ratio=server_args.hicache_ratio,  
++            hicache_size=server_args.hicache_size,  
++            hicache_write_policy="write_through",  
++            hicache_io_backend=server_args.hicache_io_backend,  
++            hicache_mem_layout=server_args.hicache_mem_layout,  
++            enable_metrics=self.enable_metrics,  
++            hicache_storage_backend="http",  
++        )  
  
      def init_disaggregation(self):
-         self.transfer_backend = TransferBackend(
-@@ -1347,7 +1371,7 @@ class Scheduler(
+         self.disaggregation_mode = DisaggregationMode(
+@@ -1405,7 +1423,7 @@ class Scheduler(
  
      def _prefetch_kvcache(self, req: Req):
          if self.enable_hicache_storage:
@@ -274,7 +288,7 @@ index 4346b0d..3d6b876 100644
              if req.last_node.backuped:
                  # only to initiate the prefetch if the last node is backuped
                  # otherwise, the allocated GPU memory must be locked for integrity
-@@ -1678,6 +1702,7 @@ class Scheduler(
+@@ -1745,6 +1763,7 @@ class Scheduler(
  
          if self.enable_hierarchical_cache:
              self.tree_cache.check_hicache_events()
@@ -282,18 +296,17 @@ index 4346b0d..3d6b876 100644
  
          # Get priority queue
          self.policy.calc_priority(self.waiting_queue)
-@@ -1733,8 +1758,8 @@ class Scheduler(
+@@ -1806,8 +1825,7 @@ class Scheduler(
                  if not prefetch_done:
                      # skip staging requests that are ongoing prefetch
                      continue
 -
 -            req.init_next_round_input(self.tree_cache)
-+            req.init_next_round_input(self.tree_cache, 
-+                                      self.moe_tree_cache)
++            req.init_next_round_input(self.tree_cache, self.moe_tree_cache)
              res = adder.add_one_req(
                  req,
                  has_chunked_req=(self.chunked_req is not None),
-@@ -1793,8 +1818,11 @@ class Scheduler(
+@@ -1866,8 +1884,11 @@ class Scheduler(
          new_batch = ScheduleBatch.init_new(
              can_run_list,
              self.req_to_token_pool,
@@ -306,35 +319,47 @@ index 4346b0d..3d6b876 100644
              self.enable_overlap,
              self.spec_algorithm,
 diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-index e06fac9..3285805 100644
+index 186216c..1932d67 100644
 --- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
 +++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-@@ -106,6 +106,7 @@ class SchedulerOutputProcessorMixin:
+@@ -56,7 +56,7 @@ class SchedulerOutputProcessorMixin:
+                     req.rid,
+                     thread_finish_flag=True,
+                 )
+-                release_kv_cache(req, self.tree_cache)
++                release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
  
-                     if req.finished():
-                         self.tree_cache.cache_finished_req(req)
-+                        self.moe_tree_cache.cache_finished_req(req)  
+         # Note: Logprobs should be handled on the prefill engine.
+         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
+@@ -121,7 +121,7 @@ class SchedulerOutputProcessorMixin:
+                             )
+                         )
+ 
+-                        release_kv_cache(req, self.tree_cache)
++                        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
                          req.time_stats.completion_time = time.perf_counter()
                      elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                          # This updates radix so others can match
-@@ -218,6 +219,7 @@ class SchedulerOutputProcessorMixin:
+@@ -250,7 +250,7 @@ class SchedulerOutputProcessorMixin:
+                     req.check_finished()
  
                      if req.finished():
-                         self.tree_cache.cache_finished_req(req)
-+                        self.moe_tree_cache.cache_finished_req(req)  
+-                        release_kv_cache(req, self.tree_cache)
++                        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
                      else:
                          self.tree_cache.cache_unfinished_req(req)
                  else:
-@@ -347,6 +349,7 @@ class SchedulerOutputProcessorMixin:
-                         self.tree_cache.cache_finished_req(req)
+@@ -353,7 +353,7 @@ class SchedulerOutputProcessorMixin:
+                     if not self.decode_offload_manager.offload_kv_cache(req):
+                         release_kv_cache(req, self.tree_cache)
                  else:
-                     self.tree_cache.cache_finished_req(req)
-+                    self.moe_tree_cache.cache_finished_req(req)  
+-                    release_kv_cache(req, self.tree_cache)
++                    release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
  
                  req.time_stats.completion_time = time.perf_counter()
  
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
-index f4daf36..e0559e5 100644
+index b4f18d8..3bb9f32 100644
 --- a/python/sglang/srt/managers/tp_worker.py
 +++ b/python/sglang/srt/managers/tp_worker.py
 @@ -96,6 +96,8 @@ class BaseTpWorker(ABC):
@@ -346,243 +371,138 @@ index f4daf36..e0559e5 100644
          )
  
      def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-diff --git a/python/sglang/srt/mem_cache/allocator.py b/python/sglang/srt/mem_cache/allocator.py
-index 4fefac9..055c18e 100644
---- a/python/sglang/srt/mem_cache/allocator.py
-+++ b/python/sglang/srt/mem_cache/allocator.py
-@@ -26,7 +26,7 @@ import torch
- import triton
- import triton.language as tl
- 
--from sglang.srt.mem_cache.memory_pool import SWAKVPool
-+from sglang.srt.mem_cache.memory_pool import MoETokenToKVPool, SWAKVPool
- from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
- 
- if TYPE_CHECKING:
-@@ -578,3 +578,43 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
- 
-     def load_cpu_copy(self, kv_cache_cpu, indices):
-         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
-+
-+
-+class MoERoutingAllocator(BaseTokenToKVPoolAllocator):  
-+    """Allocator for MoE routing cache indices."""  
-+      
-+    def __init__(  
-+        self,  
-+        size: int,  
-+        page_size: int,  
-+        dtype: torch.dtype,  
-+        device: str,  
-+        kvcache: MoETokenToKVPool,  
-+        need_sort: bool,  
-+    ):  
-+        super().__init__(size, page_size, dtype, device, kvcache, need_sort)  
-+        self.clear()  
-+      
-+    def clear(self):  
-+        self.free_pages = torch.arange(  
-+            1, self.size + 1, dtype=torch.int64, device=self.device  
-+        )  
-+        self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)  
-+      
-+    def available_size(self):  
-+        return len(self.free_pages) + len(self.release_pages)  
-+      
-+    def alloc(self, need_size: int):  
-+        if need_size > len(self.free_pages):  
-+            return None  
-+        select_index = self.free_pages[:need_size]  
-+        self.free_pages = self.free_pages[need_size:]  
-+        return select_index  
-+      
-+    def free(self, free_index: torch.Tensor):  
-+        if free_index.numel() == 0:  
-+            return  
-+        if self.need_sort:  
-+            self.release_pages = torch.cat((self.release_pages, free_index))  
-+        else:  
-+            self.free_pages = torch.cat((self.free_pages, free_index))
-\ No newline at end of file
 diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
-index 8f96ba0..ff5234a 100644
+index 48bbb36..4074fea 100644
 --- a/python/sglang/srt/mem_cache/common.py
 +++ b/python/sglang/srt/mem_cache/common.py
-@@ -7,6 +7,7 @@ import torch
- import triton
- import triton.language as tl
+@@ -338,6 +338,7 @@ def alloc_for_extend(
  
-+from sglang.srt.mem_cache.radix_cache import MoERadixCache
- from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
- from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
- from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-@@ -245,6 +246,18 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
-         # Standard allocator
-         if allocator.available_size() < num_tokens:
-             tree_cache.evict(num_tokens)
-+            
-+def alloc_moe_routing_slots(  
-+    moe_radix_cache: MoERadixCache,  
-+    num_tokens: int,  
-+) -> torch.Tensor:  
-+    allocator = moe_radix_cache.token_to_kv_pool_allocator  
-+    # logger.info(f"Allocator available size: {allocator.available_size()}")      
-+    if allocator.available_size() < num_tokens:  
-+        moe_radix_cache.evict(num_tokens - allocator.available_size())  
-+      
-+    out_cache_loc = allocator.alloc(num_tokens)        
-+    return out_cache_loc
+     bs = len(batch.reqs)
+     prefix_tensors = [r.prefix_indices for r in batch.reqs]
++    moe_prefix_tensors = [r.moe_prefix_indices for r in batch.reqs]   
  
+     # Create tensors for allocation
+     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
+@@ -345,16 +346,28 @@ def alloc_for_extend(
+     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
+     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
  
- def alloc_paged_token_slots_extend(
-@@ -383,7 +396,48 @@ def alloc_for_extend(
++    moe_prefix_lens_cpu = torch.tensor(batch.moe_prefix_lens, dtype=torch.int64)  
++    moe_extend_lens_cpu = torch.tensor(batch.moe_extend_lens, dtype=torch.int64)  
++    moe_prefix_lens_device = moe_prefix_lens_cpu.to(batch.device, non_blocking=True)
++    moe_extend_lens_device = moe_extend_lens_cpu.to(batch.device, non_blocking=True)
++
+     # Allocate req slots
+     req_pool_indices = alloc_req_slots(
+         batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
+     )
++    moe_req_pool_indices = alloc_req_slots(
++        batch.moe_req_to_token_pool, bs, batch.reqs, batch.moe_tree_cache
++    )
+     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+ 
++    moe_req_pool_indices_cpu = torch.tensor(moe_req_pool_indices, dtype=torch.int64)
++    moe_req_pool_indices_device = moe_req_pool_indices_cpu.to(batch.device, non_blocking=True)
++
+     # Allocate KV cache (throws exception on failure)
+     if batch.tree_cache.page_size == 1:
+         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
++        moe_out_cache_loc = alloc_token_slots(batch.moe_tree_cache, batch.extend_num_tokens)
+     else:
+         # Paged allocation - build last_loc
+         last_loc = [
+@@ -370,7 +383,6 @@ def alloc_for_extend(
+             last_loc=torch.cat(last_loc),
+             extend_num_tokens=batch.extend_num_tokens,
+         )
+-
+     # Write to req_to_token_pool
+     write_cache_indices(
+         out_cache_loc,
+@@ -385,8 +397,20 @@ def alloc_for_extend(
          prefix_tensors,
          batch.req_to_token_pool,
      )
 -
-+    if hasattr(batch, 'moe_tree_cache') and batch.moe_tree_cache is not None:  
-+        batch.moe_routing_cache_loc = alloc_moe_routing_slots(  
-+            batch.moe_tree_cache,  
-+            batch.extend_num_tokens  
-+        )  
-+        moe_prefix_lens_cpu = torch.tensor(batch.moe_prefix_lens, dtype=torch.int64)  
-+        moe_extend_lens_cpu = torch.tensor(batch.moe_extend_lens, dtype=torch.int64)  
-+        moe_prefix_lens_device = moe_prefix_lens_cpu.to(batch.device, non_blocking=True)  
-+        moe_extend_lens_device = moe_extend_lens_cpu.to(batch.device, non_blocking=True)  
-+
-+        moe_req_pool_indices = alloc_req_slots(batch.moe_req_to_token_pool, bs, batch.reqs, batch.moe_tree_cache)        
-+        moe_req_pool_indices_cpu = torch.tensor(moe_req_pool_indices, dtype=torch.int64)  
-+        moe_req_pool_indices_device = moe_req_pool_indices_cpu.to(batch.device, non_blocking=True)  
-+        for req, idx in zip(batch.reqs, moe_req_pool_indices):  
-+            req.moe_req_pool_idx = idx          
-+        moe_prefix_tensors = [r.moe_prefix_indices for r in batch.reqs]   
-+
-+        # logger.info(f"batch.moe_routing_cache_loc: {batch.moe_routing_cache_loc}")
-+        # logger.info(f"moe_req_pool_indices_device: {moe_req_pool_indices_device}")
-+        # logger.info(f"moe_req_pool_indices_cpu: {moe_req_pool_indices_cpu}")
-+        # logger.info(f"moe_prefix_lens_device: {moe_prefix_lens_device}")
-+        # logger.info(f"moe_prefix_lens_cpu: {moe_prefix_lens_cpu}")
-+        # logger.info(f"batch.seq_lens: {batch.seq_lens}")
-+        # logger.info(f"batch.seq_lens_cpu: {batch.seq_lens_cpu}")
-+        # logger.info(f"moe_extend_lens_device: {moe_extend_lens_device}")
-+        # logger.info(f"moe_extend_lens_cpu: {moe_extend_lens_cpu}")
-+        # logger.info(f"moe_prefix_tensors: {moe_prefix_tensors}")
-+        # logger.info(f"batch.moe_req_to_token_pool: {batch.moe_req_to_token_pool}")
-+
-+        write_cache_indices(  
-+            batch.moe_routing_cache_loc,  
-+            moe_req_pool_indices_device,  
-+            moe_req_pool_indices_cpu,  
-+            moe_prefix_lens_device,  
-+            moe_prefix_lens_cpu,  
-+            batch.seq_lens,  
-+            batch.seq_lens_cpu,  
-+            moe_extend_lens_device,  
-+            moe_extend_lens_cpu,  
-+            moe_prefix_tensors,  
-+            batch.moe_req_to_token_pool,  
-+        )  
-     return out_cache_loc, req_pool_indices_device, req_pool_indices
+-    return out_cache_loc, req_pool_indices_device, req_pool_indices
++    write_cache_indices(  
++        moe_out_cache_loc,  
++        moe_req_pool_indices_device,  
++        moe_req_pool_indices_cpu,  
++        moe_prefix_lens_device,  
++        moe_prefix_lens_cpu,  
++        batch.seq_lens,  
++        batch.seq_lens_cpu,  
++        moe_extend_lens_device,  
++        moe_extend_lens_cpu,  
++        moe_prefix_tensors,  
++        batch.moe_req_to_token_pool,  
++    )      
++    return out_cache_loc, moe_out_cache_loc, req_pool_indices_device, moe_req_pool_indices_device, req_pool_indices, moe_req_pool_indices
  
  
-@@ -458,6 +512,36 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+ def alloc_paged_token_slots_decode(
+@@ -436,6 +460,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+     if batch.tree_cache.page_size == 1:
+         # Non-paged allocation
+         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
++        moe_routing_cache_loc = alloc_token_slots(batch.moe_tree_cache, bs * token_per_req)  
+     else:
+         # Paged allocation
+         last_loc = batch.req_to_token_pool.req_to_token[
+@@ -449,6 +474,16 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+             last_loc=last_loc,
+             token_per_req=token_per_req,
+         )
++        moe_last_loc = batch.moe_req_to_token_pool.req_to_token[  
++            batch.moe_req_pool_indices, batch.seq_lens - 1  
++        ]  
++        moe_routing_cache_loc = alloc_paged_token_slots_decode(  
++            tree_cache=batch.moe_tree_cache,  
++            seq_lens=seq_lens_next,  
++            seq_lens_cpu=batch.seq_lens_cpu + token_per_req,  
++            last_loc=moe_last_loc,  
++            token_per_req=token_per_req,  
++        )
+ 
+     # Write to req_to_token_pool
+     if batch.model_config.is_encoder_decoder:
+@@ -460,11 +495,16 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
          (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
      )
  
-+
-+    if hasattr(batch, 'moe_tree_cache') and batch.moe_tree_cache is not None:  
-+        # 分配 MoE routing cache  
-+        moe_routing_cache_loc = alloc_moe_routing_slots(  
-+            batch.moe_tree_cache,   
-+            bs * token_per_req  
-+        )  
-+        if moe_routing_cache_loc is None:  
-+            raise RuntimeError(  
-+                "Failed to allocate MoE routing cache. "  
-+                f"Available: {batch.moe_tree_cache.evictable_size()}, "  
-+                f"Needed: {bs * token_per_req}"  
-+            )  
-+        batch.moe_routing_cache_loc = moe_routing_cache_loc    
-+        moe_req_pool_indices = torch.tensor(  
-+            [req.moe_req_pool_idx for req in batch.reqs],  
-+            dtype=torch.int32,  
-+            device=batch.device  
-+        )  
-+
-+        # 写入 req_to_token_pool  
-+        if batch.model_config.is_encoder_decoder:  
-+            locs = batch.encoder_lens + batch.seq_lens  
-+        else:  
-+            locs = batch.seq_lens.clone()  
-+          
-+        batch.moe_tree_cache.req_to_token_pool.write(  
-+            (moe_req_pool_indices, locs),  
-+            moe_routing_cache_loc.to(torch.int32)  
-+        )    
-     return out_cache_loc
+-    return out_cache_loc
++    batch.moe_req_to_token_pool.write(  
++        (batch.moe_req_pool_indices, locs), moe_routing_cache_loc.to(torch.int32)  
++    )    
++    return out_cache_loc, moe_routing_cache_loc
  
  
+-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
++def release_kv_cache(req: Req, tree_cache: BasePrefixCache, moe_tree_cache: BasePrefixCache = None, is_insert: bool = True):
+     tree_cache.cache_finished_req(req, is_insert=is_insert)
++    if moe_tree_cache is not None:
++        moe_tree_cache.cache_finished_req(req, is_insert=is_insert)
+     start_p, end_p = req.pop_overallocated_kv_cache()
+ 
+     global_server_args = get_global_server_args()
+@@ -486,6 +526,10 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
+         start_p:end_p
+     ]
+     tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
++    if moe_tree_cache is not None:
++        indices_to_free = moe_tree_cache.req_to_token_pool.req_to_token[req.moe_req_pool_idx][start_p:end_p]
++        # print(indices_to_free)        
++        moe_tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+ 
+ 
+ def available_and_evictable_str(tree_cache) -> str:
 diff --git a/python/sglang/srt/mem_cache/hiradix_cache.py b/python/sglang/srt/mem_cache/hiradix_cache.py
-index 6ea4e1b..df44c31 100644
+index 312732e..005a830 100644
 --- a/python/sglang/srt/mem_cache/hiradix_cache.py
 +++ b/python/sglang/srt/mem_cache/hiradix_cache.py
-@@ -8,16 +8,20 @@ from typing import List, Optional
- import torch
- 
- from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
--from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-+from sglang.srt.managers.schedule_batch import Req
-+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator, MoERoutingAllocator
- from sglang.srt.mem_cache.base_prefix_cache import MatchResult
- from sglang.srt.mem_cache.memory_pool import (
-     MHATokenToKVPool,
-     MLATokenToKVPool,
-+    MoEReqToTokenPool,
-+    MoETokenToKVPool,
-     ReqToTokenPool,
- )
- from sglang.srt.mem_cache.memory_pool_host import (
-     MHATokenToKVPoolHost,
-     MLATokenToKVPoolHost,
-+    MoETopKCachePoolHost,
- )
- from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
- from sglang.srt.metrics.collector import StorageMetricsCollector
-@@ -71,6 +75,14 @@ class HiRadixCache(RadixCache):
-                 page_size,
-                 hicache_mem_layout,
-             )
-+        elif isinstance(self.kv_cache, MoETokenToKVPool):
-+            self.token_to_kv_pool_host = MoETopKCachePoolHost(
-+                self.kv_cache,
-+                hicache_ratio,
-+                hicache_size,
-+                page_size,
-+                hicache_mem_layout
-+            )
-         else:
-             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
- 
-@@ -245,12 +257,18 @@ class HiRadixCache(RadixCache):
-             if not write_back:
-                 # no need to lock nodes if write back
-                 self.inc_lock_ref(node)
-+            # logger.info(f"L2 write initiated: node_id={node.id}")
-+            # logger.info(f"tokens={len(host_indices)}")
-+            # logger.info(f"device_indices={node.value.tolist()}")
-+            # logger.info(f"host_indices={host_indices.tolist()}" ) 
-         else:
-             return 0
- 
-         return len(host_indices)
- 
-     def write_backup_storage(self, node: TreeNode):
-+        # logger.info(f"L3 write triggered: node_id={node.id}, tokens={len(node.host_value)}")  
-+
-         prefix_keys = (
-             node.get_prefix_hash_values(node.parent)
-             if self.hicache_storage_pass_prefix_keys
-@@ -947,3 +965,91 @@ class HiRadixCache(RadixCache):
+@@ -964,3 +964,81 @@ class HiRadixCache(RadixCache):
          del self.ongoing_prefetch[rid]
          self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
          self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
@@ -591,28 +511,18 @@ index 6ea4e1b..df44c31 100644
 +class MoEHiRadixCache(HiRadixCache): 
 +    def __init__(  
 +        self,  
-+        req_to_token_pool: MoEReqToTokenPool,  
-+        token_to_kv_pool_allocator: MoERoutingAllocator,  
-+        tp_cache_group: torch.distributed.ProcessGroup,  # 新增  
++        req_to_token_pool: ReqToTokenPool,  
++        token_to_kv_pool_allocator,  
++        tp_cache_group: torch.distributed.ProcessGroup,  
 +        page_size: int,  
-+        hicache_ratio: float,  # 新增  
-+        hicache_size: int,  # 新增  
-+        hicache_write_policy: str,  # 新增  
-+        hicache_io_backend: str,  # 新增  
-+        hicache_mem_layout: str,  # 新增  
-+        enable_metrics: bool,  # 新增  
-+        hicache_storage_backend: Optional[str] = None,  # 新增  
-+        disable: bool = False,  
++        hicache_ratio: float, 
++        hicache_size: int, 
++        hicache_write_policy: str, 
++        hicache_io_backend: str,
++        hicache_mem_layout: str, 
++        enable_metrics: bool, 
++        hicache_storage_backend: Optional[str] = None, 
 +    ):  
-+        self.kv_cache = token_to_kv_pool_allocator.get_kvcache()  
-+        self.token_to_kv_pool_host = MoETopKCachePoolHost(  
-+            self.kv_cache,  
-+            hicache_ratio,  
-+            hicache_size,  
-+            page_size,  
-+            hicache_mem_layout,  
-+        )  
-+          
 +        super().__init__(  
 +            req_to_token_pool=req_to_token_pool,  
 +            token_to_kv_pool_allocator=token_to_kv_pool_allocator,  
@@ -626,7 +536,8 @@ index 6ea4e1b..df44c31 100644
 +            enable_metrics=enable_metrics,  
 +            hicache_storage_backend=hicache_storage_backend,  
 +        )
-+    def cache_finished_req(self, req: Req, is_insert: bool = True):  
++        
++    def cache_finished_req(self, req, is_insert: bool = True):  
 +        if self.disable:  
 +            if req.moe_req_pool_idx is not None:  
 +                all_token_len = len(req.origin_input_ids) + len(req.output_ids)  
@@ -673,585 +584,7 @@ index 6ea4e1b..df44c31 100644
 +
 +        self.req_to_token_pool.free(req.moe_req_pool_idx)  
 +        self.dec_lock_ref(req.moe_last_node)
-+        self.check_hicache_events()
-diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-findex 975c727..c562a13 100644
---- a/python/sglang/srt/mem_cache/memory_pool.py
-+++ b/python/sglang/srt/mem_cache/memory_pool.py
-@@ -1918,3 +1918,153 @@ def copy_all_layer_kv_cache_tiled(
-     mask = mask_loc[:, None] & mask_byte[None, :]
-     vals = tl.load(src_ptr, mask=mask)
-     tl.store(tgt_ptr, vals, mask=mask)
-+
-+class MoETokenToKVPool(KVCache):  
-+    """Cache for MoE top-k expert routing results with memory usage tracking."""  
-+      
-+    def __init__(  
-+        self,  
-+        size: int,  
-+        page_size: int,  
-+        dtype: torch.dtype,  
-+        layer_num: int,  
-+        device: str,  
-+        num_experts_per_tok: int,  
-+        enable_memory_saver: bool,  
-+        start_layer: Optional[int] = None,  
-+        end_layer: Optional[int] = None,  
-+        enable_alt_stream: bool = True,
-+    ):  
-+        super().__init__(  
-+            size,  
-+            page_size,  
-+            dtype,  
-+            layer_num,  
-+            device,  
-+            enable_memory_saver,  
-+            start_layer,  
-+            end_layer,  
-+        )  
-+        self.num_experts_per_tok = num_experts_per_tok  
-+        self.num_writes = 0 
-+        self.total_tokens_written = 0 
-+        self._create_buffers()  
-+        
-+        self.device_module = torch.get_device_module(self.device)  
-+        self.alt_stream = (  
-+            self.device_module.Stream() if _is_cuda and enable_alt_stream else None  
-+        )
-+        self._finalize_allocation_log(size)  
-+      
-+    def _create_buffers(self):  
-+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):  
-+            with (  
-+                torch.cuda.use_mem_pool(self.custom_mem_pool)  
-+                if self.enable_custom_mem_pool  
-+                else nullcontext()  
-+            ):  
-+                self.expert_indices_buffer = [  
-+                    torch.zeros(  
-+                        (self.size + self.page_size, self.num_experts_per_tok),  
-+                        dtype=torch.int32,  
-+                        device=self.device,  
-+                    )  
-+                    for _ in range(self.layer_num)  
-+                ]  
-+                self.routing_weights_buffer = [  
-+                    torch.zeros(  
-+                        (self.size + self.page_size, self.num_experts_per_tok),  
-+                        dtype=self.dtype,  
-+                        device=self.device,  
-+                    )  
-+                    for _ in range(self.layer_num)  
-+                ]  
-+      
-+    def get_key_buffer(self, layer_id: int):  
-+        return self.expert_indices_buffer[layer_id - self.start_layer]  
-+      
-+    def get_value_buffer(self, layer_id: int):  
-+        return self.routing_weights_buffer[layer_id - self.start_layer]  
-+      
-+    def get_kv_buffer(self, layer_id: int):  
-+        return (  
-+            self.expert_indices_buffer[layer_id - self.start_layer],  
-+            self.routing_weights_buffer[layer_id - self.start_layer],  
-+        )  
-+      
-+    def set_kv_buffer(    
-+        self,    
-+        layer_id: int,    
-+        loc: torch.Tensor,    
-+        cache_expert_indices: torch.Tensor,    
-+        cache_routing_weights: torch.Tensor,    
-+    ):    
-+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode    
-+          
-+        if cache_expert_indices.dtype != torch.int32:    
-+            cache_expert_indices = cache_expert_indices.to(torch.int32)    
-+        if cache_routing_weights.dtype != self.dtype:    
-+            cache_routing_weights = cache_routing_weights.to(self.dtype)    
-+          
-+        layer_idx = layer_id - self.start_layer    
-+          
-+        if get_is_capture_mode() and self.alt_stream is not None:    
-+            current_stream = self.device_module.current_stream()    
-+            self.alt_stream.wait_stream(current_stream)    
-+            self.expert_indices_buffer[layer_idx][loc] = cache_expert_indices    
-+            with self.device_module.stream(self.alt_stream):    
-+                self.routing_weights_buffer[layer_idx][loc] = cache_routing_weights    
-+            current_stream.wait_stream(self.alt_stream)    
-+        else:    
-+            self.expert_indices_buffer[layer_idx][loc] = cache_expert_indices    
-+            self.routing_weights_buffer[layer_idx][loc] = cache_routing_weights
-+      
-+    def get_kv_size_bytes(self):  
-+        indices_size = sum(  
-+            get_tensor_size_bytes(buf) for buf in self.expert_indices_buffer  
-+        )  
-+        weights_size = sum(  
-+            get_tensor_size_bytes(buf) for buf in self.routing_weights_buffer  
-+        )  
-+        return indices_size, weights_size  
-+    
-+class MoEReqToTokenPool:  
-+    """Maps requests to their MoE routing cache locations."""  
-+      
-+    def __init__(  
-+        self,  
-+        size: int,  
-+        max_context_len: int,  
-+        device: str,  
-+        enable_memory_saver: bool,  
-+    ):  
-+        self.size = size  
-+        self.max_context_len = max_context_len  
-+        self.device = device  
-+          
-+        memory_saver_adapter = TorchMemorySaverAdapter.create(  
-+            enable=enable_memory_saver  
-+        )  
-+          
-+        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):  
-+            self.req_to_token = torch.zeros(  
-+                (size, max_context_len), dtype=torch.int32, device=device  
-+            )  
-+          
-+        self.free_slots = list(range(size))  
-+      
-+    def write(self, indices, values):  
-+        self.req_to_token[indices] = values  
-+      
-+    def alloc(self, need_size: int):  
-+        if need_size > len(self.free_slots):  
-+            return None  
-+        select_index = self.free_slots[:need_size]  
-+        self.free_slots = self.free_slots[need_size:]  
-+        return select_index  
-+      
-+    def free(self, free_index):  
-+        if isinstance(free_index, int):  
-+            self.free_slots.append(free_index)  
-+        else:  
-+            self.free_slots.extend(free_index)    
 \ No newline at end of file
-diff --git a/python/sglang/srt/mem_cache/memory_pool_host.py b/python/sglang/srt/mem_cache/memory_pool_host.py
-index edfae2c..8139104 100644
---- a/python/sglang/srt/mem_cache/memory_pool_host.py
-+++ b/python/sglang/srt/mem_cache/memory_pool_host.py
-@@ -7,7 +7,7 @@ from typing import Optional
- import psutil
- import torch
- 
--from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
-+from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool, MoETokenToKVPool
- from sglang.srt.utils import is_npu, is_xpu
- 
- _is_npu = is_npu()
-@@ -753,3 +753,286 @@ class MLATokenToKVPoolHost(HostKVCache):
-         else:
-             raise ValueError(f"Unsupported layout: {self.layout}")
-         return ptr_list, element_size_list
-+
-+
-+class MoETopKCachePoolHost(HostKVCache):  
-+    device_pool: MoETokenToKVPool  
-+      
-+    def __init__(  
-+        self,  
-+        device_pool,  
-+        host_to_device_ratio: float,  
-+        host_size: int,  
-+        page_size: int,  
-+        layout: str,  
-+        pin_memory: bool = True,  
-+        device: str = "cpu",  
-+    ):  
-+        self.num_experts_per_tok = device_pool.num_experts_per_tok  
-+          
-+        super().__init__(  
-+            device_pool,  
-+            host_to_device_ratio,  
-+            host_size,  
-+            page_size,  
-+            layout,  
-+            pin_memory,  
-+            device,  
-+        )  
-+          
-+        self.expert_indices_data_refs = [  
-+            self.expert_indices_buffer[i] for i in range(self.layer_num)  
-+        ]  
-+        self.routing_weights_data_refs = [  
-+            self.routing_weights_buffer[i] for i in range(self.layer_num)  
-+        ]  
-+          
-+        self.expert_indices_data_ptrs = torch.tensor(  
-+            [x.data_ptr() for x in self.expert_indices_data_refs],  
-+            dtype=torch.uint64,  
-+            device=self.device_pool.device,  
-+        )  
-+        self.routing_weights_data_ptrs = torch.tensor(  
-+            [x.data_ptr() for x in self.routing_weights_data_refs],  
-+            dtype=torch.uint64,  
-+            device=self.device_pool.device,  
-+        )  
-+  
-+    def get_size_per_token(self):  
-+        self.layer_num = self.device_pool.layer_num  
-+        indices_size = self.num_experts_per_tok * 4  
-+        weights_size = self.num_experts_per_tok * self.dtype.itemsize  
-+        return (indices_size + weights_size) * self.layer_num  
-+  
-+    def init_kv_buffer(self):  
-+        if self.layout == "layer_first":  
-+            expert_indices_dims = (self.layer_num, self.size, self.num_experts_per_tok)  
-+            routing_weights_dims = (self.layer_num, self.size, self.num_experts_per_tok)  
-+        elif self.layout == "page_first":  
-+            expert_indices_dims = (self.size, self.layer_num, self.num_experts_per_tok)  
-+            routing_weights_dims = (self.size, self.layer_num, self.num_experts_per_tok)  
-+        elif self.layout == "page_first_direct":  
-+            expert_indices_dims = (  
-+                self.page_num,  
-+                self.layer_num,  
-+                self.page_size,  
-+                self.num_experts_per_tok,  
-+            )  
-+            routing_weights_dims = (  
-+                self.page_num,  
-+                self.layer_num,  
-+                self.page_size,  
-+                self.num_experts_per_tok,  
-+            )  
-+        else:  
-+            raise ValueError(f"Unsupported layout: {self.layout}")  
-+          
-+        self.token_stride_size_indices = self.num_experts_per_tok * 4  
-+        self.token_stride_size_weights = self.num_experts_per_tok * self.dtype.itemsize  
-+        self.layout_dim_indices = self.token_stride_size_indices * self.layer_num  
-+        self.layout_dim_weights = self.token_stride_size_weights * self.layer_num  
-+          
-+        self.expert_indices_buffer = torch.empty(  
-+            expert_indices_dims,  
-+            dtype=torch.int32,  
-+            device=self.device,  
-+            pin_memory=self.pin_memory,  
-+        )  
-+          
-+        self.routing_weights_buffer = torch.empty(  
-+            routing_weights_dims,  
-+            dtype=self.dtype,  
-+            device=self.device,  
-+            pin_memory=self.pin_memory,  
-+        )  
-+          
-+        return (self.expert_indices_buffer, self.routing_weights_buffer)  
-+  
-+    def backup_from_device_all_layer(  
-+        self, device_pool, host_indices, device_indices, io_backend  
-+    ):  
-+        if io_backend == "kernel":  
-+            io_backend = "direct"  
-+          
-+        if io_backend == "direct":  
-+            if self.layout == "layer_first":  
-+                for layer_id in range(self.layer_num):  
-+                    self.expert_indices_buffer[layer_id][host_indices] = \
-+                        device_pool.expert_indices_buffer[layer_id][device_indices].cpu()  
-+                    self.routing_weights_buffer[layer_id][host_indices] = \
-+                        device_pool.routing_weights_buffer[layer_id][device_indices].cpu()  
-+                          
-+            elif self.layout in ["page_first", "page_first_direct"]:  
-+                for layer_id in range(self.layer_num):  
-+                    if self.layout == "page_first":  
-+                        self.expert_indices_buffer[host_indices, layer_id, :] = \
-+                            device_pool.expert_indices_buffer[layer_id][device_indices].cpu()  
-+                        self.routing_weights_buffer[host_indices, layer_id, :] = \
-+                            device_pool.routing_weights_buffer[layer_id][device_indices].cpu()  
-+                    else:  
-+                        for i, (h_idx, d_idx) in enumerate(zip(host_indices.tolist(), device_indices.tolist())):  
-+                            page_idx = h_idx // self.page_size  
-+                            in_page_idx = h_idx % self.page_size  
-+                            self.expert_indices_buffer[page_idx, layer_id, in_page_idx, :] = \
-+                                device_pool.expert_indices_buffer[layer_id][d_idx].cpu()  
-+                            self.routing_weights_buffer[page_idx, layer_id, in_page_idx, :] = \
-+                                device_pool.routing_weights_buffer[layer_id][d_idx].cpu()  
-+            else:  
-+                raise ValueError(f"Unsupported layout: {self.layout}")  
-+        else:  
-+            raise ValueError(f"Unsupported IO backend: {io_backend}")  
-+  
-+    def load_to_device_per_layer(  
-+        self, device_pool, host_indices, device_indices, layer_id, io_backend  
-+    ):  
-+        if io_backend == "kernel":  
-+            io_backend = "direct"  
-+          
-+        if io_backend == "direct":  
-+            if self.layout == "layer_first":  
-+                device_pool.expert_indices_buffer[layer_id][device_indices] = \
-+                    self.expert_indices_buffer[layer_id][host_indices].to(device_pool.device)  
-+                device_pool.routing_weights_buffer[layer_id][device_indices] = \
-+                    self.routing_weights_buffer[layer_id][host_indices].to(device_pool.device)  
-+                      
-+            elif self.layout == "page_first":  
-+                device_pool.expert_indices_buffer[layer_id][device_indices] = \
-+                    self.expert_indices_buffer[host_indices, layer_id, :].to(device_pool.device)  
-+                device_pool.routing_weights_buffer[layer_id][device_indices] = \
-+                    self.routing_weights_buffer[host_indices, layer_id, :].to(device_pool.device) 
-+                      
-+            elif self.layout == "page_first_direct":  
-+                for i, (h_idx, d_idx) in enumerate(zip(host_indices.tolist(), device_indices.tolist())):  
-+                    page_idx = h_idx // self.page_size  
-+                    in_page_idx = h_idx % self.page_size  
-+                    device_pool.expert_indices_buffer[layer_id][d_idx] = \
-+                        self.expert_indices_buffer[page_idx, layer_id, in_page_idx, :].to(device_pool.device)  
-+                    device_pool.routing_weights_buffer[layer_id][d_idx] = \
-+                        self.routing_weights_buffer[page_idx, layer_id, in_page_idx, :].to(device_pool.device)  
-+            else:  
-+                raise ValueError(f"Unsupported layout: {self.layout}")  
-+        else:  
-+            raise ValueError(f"Unsupported IO backend: {io_backend}")  
-+  
-+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:  
-+        if self.layout == "layer_first":  
-+            expert_indices_page = self.expert_indices_buffer[:, index:index+self.page_size, :]  
-+            routing_weights_page = self.routing_weights_buffer[:, index:index+self.page_size, :]  
-+        elif self.layout == "page_first":  
-+            expert_indices_page = self.expert_indices_buffer[index:index+self.page_size, :, :]  
-+            routing_weights_page = self.routing_weights_buffer[index:index+self.page_size, :, :]  
-+        elif self.layout == "page_first_direct":  
-+            real_index = index // self.page_size  
-+            expert_indices_page = self.expert_indices_buffer[real_index:real_index+1, :, :, :]  
-+            routing_weights_page = self.routing_weights_buffer[real_index:real_index+1, :, :, :]  
-+        else:  
-+            raise ValueError(f"Unsupported layout: {self.layout}")  
-+          
-+        if flat:  
-+            return torch.cat([  
-+                expert_indices_page.flatten().to(self.dtype),  
-+                routing_weights_page.flatten()  
-+            ])  
-+        else:  
-+            return (expert_indices_page, routing_weights_page)  
-+  
-+    def get_dummy_flat_data_page(self) -> torch.Tensor:  
-+        expert_indices_dummy = torch.zeros(  
-+            (self.layer_num, self.page_size, self.num_experts_per_tok),  
-+            dtype=torch.int32,  
-+            device=self.device,  
-+            pin_memory=self.pin_memory,  
-+        )  
-+        routing_weights_dummy = torch.zeros(  
-+            (self.layer_num, self.page_size, self.num_experts_per_tok),  
-+            dtype=self.dtype,  
-+            device=self.device,  
-+            pin_memory=self.pin_memory,  
-+        )  
-+        return torch.cat([  
-+            expert_indices_dummy.flatten().to(self.dtype),  
-+            routing_weights_dummy.flatten()  
-+        ])  
-+  
-+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:  
-+        indices_size = self.layer_num * self.page_size * self.num_experts_per_tok  
-+        expert_indices_flat = data_page[:indices_size].to(torch.int32)  
-+        routing_weights_flat = data_page[indices_size:]  
-+          
-+        if self.layout == "layer_first":  
-+            self.expert_indices_buffer[:, index:index+self.page_size, :] = \
-+                expert_indices_flat.reshape(self.layer_num, self.page_size, self.num_experts_per_tok)  
-+            self.routing_weights_buffer[:, index:index+self.page_size, :] = \
-+                routing_weights_flat.reshape(self.layer_num, self.page_size, self.num_experts_per_tok)  
-+                  
-+        elif self.layout == "page_first":  
-+            self.expert_indices_buffer[index:index+self.page_size, :, :] = \
-+                expert_indices_flat.reshape(self.page_size, self.layer_num, self.num_experts_per_tok)  
-+            self.routing_weights_buffer[index:index+self.page_size, :, :] = \
-+                routing_weights_flat.reshape(self.page_size, self.layer_num, self.num_experts_per_tok)  
-+                  
-+        elif self.layout == "page_first_direct":  
-+            real_index = index // self.page_size  
-+            self.expert_indices_buffer[real_index:real_index+1, :, :, :] = \
-+                expert_indices_flat.reshape(1, self.layer_num, self.page_size, self.num_experts_per_tok)  
-+            self.routing_weights_buffer[real_index:real_index+1, :, :, :] = \
-+                routing_weights_flat.reshape(1, self.layer_num, self.page_size, self.num_experts_per_tok)  
-+        else:  
-+            raise ValueError(f"Unsupported layout: {self.layout}")  
-+  
-+    def get_page_buffer_meta(self, indices):  
-+        assert len(indices) % self.page_size == 0  
-+        ptr_list = []  
-+        expert_indices_data_ptr = self.expert_indices_buffer.data_ptr()  
-+        routing_weights_data_ptr = self.routing_weights_buffer.data_ptr()  
-+        indices = indices.tolist()  
-+          
-+        if self.layout == "layer_first":  
-+            for index in range(0, len(indices), self.page_size):  
-+                for layer_id in range(self.layer_num):  
-+                    indices_ptr = (  
-+                        expert_indices_data_ptr  
-+                        + indices[index] * self.num_experts_per_tok * 4  
-+                        + layer_id * self.size * self.num_experts_per_tok * 4  
-+                    )  
-+                    ptr_list.append(indices_ptr)  
-+                      
-+                    weights_ptr = (  
-+                        routing_weights_data_ptr  
-+                        + indices[index] * self.num_experts_per_tok * self.dtype.itemsize  
-+                        + layer_id * self.size * self.num_experts_per_tok * self.dtype.itemsize  
-+                    )  
-+                    ptr_list.append(weights_ptr)  
-+              
-+            indices_element_size = self.page_size * self.num_experts_per_tok * 4  
-+            weights_element_size = self.page_size * self.num_experts_per_tok * self.dtype.itemsize  
-+            element_size_list = []  
-+            for _ in range(len(indices) // self.page_size):  
-+                for _ in range(self.layer_num):  
-+                    element_size_list.append(indices_element_size)  
-+                    element_size_list.append(weights_element_size)  
-+                      
-+        elif self.layout in ["page_first", "page_first_direct"]:  
-+            for index in range(0, len(indices), self.page_size):  
-+                indices_ptr = (  
-+                    expert_indices_data_ptr  
-+                    + indices[index] * self.layer_num * self.num_experts_per_tok * 4  
-+                )  
-+                ptr_list.append(indices_ptr)  
-+                  
-+                weights_ptr = (  
-+                    routing_weights_data_ptr  
-+                    + indices[index] * self.layer_num * self.num_experts_per_tok * self.dtype.itemsize  
-+                )  
-+                ptr_list.append(weights_ptr)  
-+              
-+            indices_element_size = self.layer_num * self.page_size * self.num_experts_per_tok * 4  
-+            weights_element_size = self.layer_num * self.page_size * self.num_experts_per_tok * self.dtype.itemsize  
-+            element_size_list = []  
-+            for _ in range(len(indices) // self.page_size):  
-+                element_size_list.append(indices_element_size)  
-+                element_size_list.append(weights_element_size)  
-+        else:  
-+            raise ValueError(f"Unsupported layout: {self.layout}")  
-+          
-+        return ptr_list, element_size_list
-\ No newline at end of file
-diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
-index af96834..d7b8933 100644
---- a/python/sglang/srt/mem_cache/radix_cache.py
-+++ b/python/sglang/srt/mem_cache/radix_cache.py
-@@ -1,4 +1,5 @@
- from __future__ import annotations
-+import logging
- 
- """
- Copyright 2023-2024 SGLang Team
-@@ -32,7 +33,7 @@ from sglang.srt.disaggregation.kv_events import (
-     BlockRemoved,
-     BlockStored,
- )
--from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator, MoERoutingAllocator
- from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
- from sglang.srt.mem_cache.evict_policy import (
-     EvictionStrategy,
-@@ -42,11 +43,12 @@ from sglang.srt.mem_cache.evict_policy import (
-     LRUStrategy,
-     MRUStrategy,
- )
--from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-+from sglang.srt.mem_cache.memory_pool import MoEReqToTokenPool, ReqToTokenPool
- 
- if TYPE_CHECKING:
-     from sglang.srt.managers.schedule_batch import Req
- 
-+logger = logging.getLogger(__name__)
- 
- class RadixKey:
- 
-@@ -743,6 +745,84 @@ class RadixCache(BasePrefixCache):
-         return events
- 
- 
-+class MoERadixCache(RadixCache):  
-+    """RadixCache for MoE routing results."""  
-+      
-+    def __init__(  
-+        self,  
-+        req_to_token_pool: MoEReqToTokenPool,  
-+        token_to_kv_pool_allocator: MoERoutingAllocator,  
-+        page_size: int,  
-+        disable: bool = False,  
-+    ):  
-+        super().__init__(  
-+            req_to_token_pool=req_to_token_pool,  
-+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,  
-+            page_size=page_size,  
-+            disable=disable,  
-+        )  
-+
-+    def cache_finished_req(self, req: Req, is_insert: bool = True):  
-+        if self.disable or req.moe_req_pool_idx is None:  
-+            if req.moe_req_pool_idx is not None:  
-+                # 注意:这里使用 all_token_len 而不是 all_token_len - 1  
-+                # 因为 MoE routing cache 为每个 token 都存储了 routing 结果  
-+                all_token_len = len(req.origin_input_ids) + len(req.output_ids)  
-+                moe_indices = self.req_to_token_pool.req_to_token[  
-+                    req.moe_req_pool_idx, :all_token_len  
-+                ]  
-+                self.token_to_kv_pool_allocator.free(moe_indices)  
-+                self.req_to_token_pool.free(req.moe_req_pool_idx)  
-+            return  
-+    
-+        # 2. 计算实际的 token 长度  
-+        # 注意:MoE routing cache 不需要 -1,因为每个 token 都有 routing 结果  
-+        all_token_len = len(req.origin_input_ids) + len(req.output_ids)  
-+        
-+        # 3. 获取 MoE routing cache 的索引  
-+        moe_indices = self.req_to_token_pool.req_to_token[  
-+            req.moe_req_pool_idx, :all_token_len  
-+        ]  
-+    
-+        # 4. 处理页对齐  
-+        if self.page_size != 1:  
-+            page_aligned_len = all_token_len // self.page_size * self.page_size  
-+            page_aligned_moe_indices = moe_indices[:page_aligned_len].to(  
-+                dtype=torch.int64, copy=True  
-+            )  
-+        else:  
-+            page_aligned_len = all_token_len  
-+            page_aligned_moe_indices = moe_indices.to(dtype=torch.int64, copy=True)  
-+    
-+        # 5. 获取 token IDs 用作 key  
-+        token_ids = (req.origin_input_ids + req.output_ids)[:page_aligned_len]  
-+    
-+        # 6. 计算已缓存的前缀长度  
-+        # 使用 moe_prefix_indices 而不是 prefix_indices  
-+        old_prefix_len = len(req.moe_prefix_indices) if req.moe_prefix_indices is not None else 0  
-+    
-+        # 7. 插入到 RadixTree 或释放内存  
-+        if is_insert:  
-+            new_prefix_len = self.insert(  
-+                RadixKey(token_ids, req.extra_key),  
-+                page_aligned_moe_indices,  
-+            )  
-+            # 释放树中已存在的重复部分  
-+            if old_prefix_len < new_prefix_len:  
-+                self.token_to_kv_pool_allocator.free(  
-+                    moe_indices[old_prefix_len:new_prefix_len]  
-+                )  
-+        else:  
-+            self.token_to_kv_pool_allocator.free(  
-+                moe_indices[old_prefix_len:page_aligned_len]  
-+            )  
-+    
-+        if page_aligned_len < all_token_len:  
-+            self.token_to_kv_pool_allocator.free(moe_indices[page_aligned_len:])  
-+
-+        self.req_to_token_pool.free(req.moe_req_pool_idx)  
-+        self.dec_lock_ref(req.moe_last_node)
-+
- if __name__ == "__main__":
-     tree = RadixCache(None, None, page_size=1, disable=False)
- 
 diff --git a/python/sglang/srt/mem_cache/storage/backend_factory.py b/python/sglang/srt/mem_cache/storage/backend_factory.py
 index 4b195c8..e2c2d27 100644
 --- a/python/sglang/srt/mem_cache/storage/backend_factory.py
@@ -1278,10 +611,10 @@ index 4b195c8..e2c2d27 100644
 \ No newline at end of file
 diff --git a/python/sglang/srt/mem_cache/storage/http_backend/storage_http.py b/python/sglang/srt/mem_cache/storage/http_backend/storage_http.py
 new file mode 100644
-index 0000000..376e00b
+index 0000000..b1a7ab2
 --- /dev/null
 +++ b/python/sglang/srt/mem_cache/storage/http_backend/storage_http.py
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,132 @@
 +import asyncio
 +import logging
 +
@@ -1306,7 +639,6 @@ index 0000000..376e00b
 +        self.tp_rank = storage_config.tp_rank  
 +        self.tp_size = storage_config.tp_size  
 +        self.is_mla_model = storage_config.is_mla_model    
-+        _start_server()            
 +
 +    def get(  
 +        self,  
@@ -1362,7 +694,7 @@ index 0000000..376e00b
 +        key: str,  
 +        value: Optional[Any] = None,  
 +        target_location: Optional[Any] = None,  
-+        target_sizes: Optional[Any] = None,  
++       target_sizes: Optional[Any] = None,  
 +    ) -> bool:  
 +        try:  
 +            if value is not None:  
@@ -1414,172 +746,127 @@ index 0000000..376e00b
 +            logger.error(f"HTTP exists failed: {e}")  
 +            return False
 +
-+        
-+class BatchSetRequest(BaseModel):  
-+    keys: List[str]  
-+    data: List[List[float]]  
-+  
-+class BatchGetRequest(BaseModel):  
-+    keys: List[str]  
-+  
-+class BatchExistsRequest(BaseModel):  
-+    keys: List[str]  
-+
-+def _check_server_health(server_url: str = "http://localhost:8000", retries: int = 3, delay: float = 1) -> bool:  
-+    for i in range(retries):  
-+        try:  
-+            response = requests.get(f"{server_url}/health", timeout=2)  
-+            if response.status_code == 200:  
-+                logger.info(f"HTTP server is healthy at {server_url}")  
-+                return True  
-+        except requests.exceptions.RequestException as e:  
-+            if i < retries - 1:  
-+                logger.debug(f"Health check attempt {i+1} failed: {e}")  
-+                time.sleep(delay)  
-+            continue  
-+      
-+    logger.warning(f"HTTP server health check failed after {retries} attempts")  
-+    return False
-+
-+def _start_server():  
-+    try:  
-+        app = FastAPI()  
-+        storage = {}  
-+          
-+        @app.post("/batch_set")  
-+        async def batch_set(request: BatchSetRequest):  
-+            results = []  
-+            for key, data in zip(request.keys, request.data):  
-+                storage[key] = data  
-+            return {"results": results}  
-+        
-+        @app.post("/batch_get")  
-+        async def batch_get(request: BatchGetRequest): 
-+            data = [storage.get(key) for key in request.keys] 
-+            return {"data": data}  
-+        
-+        @app.post("/batch_exists")  
-+        async def batch_exists(request: BatchExistsRequest):  
-+            consecutive_hits = 0  
-+            for key in request.keys:  
-+                if key in storage:  
-+                    consecutive_hits += 1  
-+                else:  
-+                    break  
-+            return {"consecutive_hits": consecutive_hits}  
-+          
-+        @app.get("/health")  
-+        async def health_check():  
-+            return {"status": "healthy"}  
-+          
-+        def run_server():  
-+            try:  
-+                loop = asyncio.new_event_loop()  
-+                asyncio.set_event_loop(loop)  
-+                  
-+                config = uvicorn.Config(  
-+                    app,  
-+                    host="0.0.0.0",  
-+                    port=8000,  
-+                    log_level="info",  
-+                    loop="asyncio"  
-+                )  
-+                server = uvicorn.Server(config)  
-+                loop.run_until_complete(server.serve())  
-+            except Exception as e:  
-+                logger.error(f"Failed to start HTTP server: {e}")  
-+          
-+        _server_thread = threading.Thread(  
-+            target=run_server,  
-+            daemon=True,  
-+            name="HiCache-HTTP-Server"  
-+        )  
-+        _server_thread.start()  
-+          
-+        for i in range(10):  
-+            time.sleep(0.5)  
-+            if _check_server_health(retries=1, delay=0.1):  
-+                _server_started = True  
-+                logger.info("HTTP server started successfully")  
-+                break  
-+        else:  
-+            logger.error("HTTP server failed to start within timeout")  
-+              
-+    except Exception as e:  
-+        logger.error(f"Error starting HTTP server: {e}")        
++    
 \ No newline at end of file
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index 58e95ba..541fe36 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -311,6 +311,9 @@ class CudaGraphRunner:
+             self.out_cache_loc = torch.zeros(
+                 (self.max_num_token,), dtype=self._cache_loc_dtype()
+             )
++            self.moe_out_cache_loc = torch.zeros(
++                (self.max_num_token,), dtype=self._cache_loc_dtype()
++            )            
+             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+             self.mrope_positions = torch.zeros(
+                 (3, self.max_num_token), dtype=torch.int64
+@@ -548,6 +551,7 @@ class CudaGraphRunner:
+         seq_lens = self.seq_lens[:bs]
+         seq_lens_cpu = self.seq_lens_cpu[:bs]
+         out_cache_loc = self.out_cache_loc[:num_tokens]
++        moe_out_cache_loc = self.moe_out_cache_loc[:num_tokens]
+         positions = self.positions[:num_tokens]
+         if self.is_encoder_decoder:
+             encoder_lens = self.encoder_lens[:bs]
+@@ -622,8 +626,10 @@ class CudaGraphRunner:
+             orig_seq_lens=seq_lens,
+             req_to_token_pool=self.model_runner.req_to_token_pool,
+             token_to_kv_pool=self.model_runner.token_to_kv_pool,
++            moe_token_to_kv_pool=self.model_runner.moe_token_to_kv_pool,
+             attn_backend=self.model_runner.attn_backend,
+             out_cache_loc=out_cache_loc,
++            moe_out_cache_loc=moe_out_cache_loc,
+             seq_lens_sum=seq_lens.sum().item(),
+             encoder_lens=encoder_lens,
+             return_logprob=False,
+@@ -758,12 +764,14 @@ class CudaGraphRunner:
+         if bs != raw_bs:
+             self.seq_lens.fill_(self.seq_len_fill_value)
+             self.out_cache_loc.zero_()
++            self.moe_out_cache_loc.zero_()
+ 
+         # Common inputs
+         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
++        self.moe_out_cache_loc[:raw_num_token].copy_(forward_batch.moe_out_cache_loc)
+         self.positions[:raw_num_token].copy_(forward_batch.positions)
+ 
+         seq_lens_cpu = None
 diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
-index 82ea20f..1c4e3d3 100644
+index 4c3a329..f0e151f 100644
 --- a/python/sglang/srt/model_executor/forward_batch_info.py
 +++ b/python/sglang/srt/model_executor/forward_batch_info.py
-@@ -318,6 +318,8 @@ class ForwardBatch:
-     tbo_split_seq_index: Optional[int] = None
-     tbo_parent_token_range: Optional[Tuple[int, int]] = None
-     tbo_children: Optional[List[ForwardBatch]] = None
-+    moe_routing_cache: Optional[KVCache] = None  
-+    moe_routing_cache_loc: Optional[torch.Tensor] = None  # 新增!    
+@@ -194,6 +194,7 @@ class ForwardBatch:
+     seq_lens: torch.Tensor
+     # The indices of output tokens in the token_to_kv_pool
+     out_cache_loc: torch.Tensor
++    moe_out_cache_loc: torch.Tensor
  
-     @classmethod
-     def init_new(
-@@ -360,6 +362,8 @@ class ForwardBatch:
-             input_embeds=batch.input_embeds,
+     # The sum of all sequence lengths
+     seq_lens_sum: int
+@@ -287,7 +288,9 @@ class ForwardBatch:
+ 
+     # Attention backend
+     req_to_token_pool: ReqToTokenPool = None
++    moe_req_to_token_pool: Optional[KVCache] = None  
+     token_to_kv_pool: KVCache = None
++    moe_token_to_kv_pool: Optional[KVCache] = None
+     attn_backend: AttentionBackend = None
+ 
+     # For DP attention
+@@ -347,6 +350,7 @@ class ForwardBatch:
+             req_pool_indices=batch.req_pool_indices,
+             seq_lens=batch.seq_lens,
+             out_cache_loc=batch.out_cache_loc,
++            moe_out_cache_loc=batch.moe_out_cache_loc,             
+             mm_inputs=batch.multimodal_inputs,
+             encoder_cached=batch.encoder_cached,
+             encoder_lens=batch.encoder_lens,
+@@ -374,6 +378,8 @@ class ForwardBatch:
              token_type_ids=batch.token_type_ids,
              tbo_split_seq_index=batch.tbo_split_seq_index,
-+            moe_routing_cache=model_runner.moe_routing_cache,  
-+            moe_routing_cache_loc=batch.moe_routing_cache_loc,  # 添加这个  
+             dimensions=batch.dimensions,
++            moe_req_to_token_pool=model_runner.moe_req_to_token_pool,  
++            moe_token_to_kv_pool=model_runner.moe_token_to_kv_pool,
          )
          device = model_runner.device
  
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 34afad0..0027673 100644
+index 8c1be25..9023922 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -84,6 +84,7 @@ from sglang.srt.lora.lora_manager import LoRAManager
- from sglang.srt.lora.lora_registry import LoRARef
- from sglang.srt.mem_cache.allocator import (
-     BaseTokenToKVPoolAllocator,
-+    MoERoutingAllocator,
-     PagedTokenToKVPoolAllocator,
-     SWATokenToKVPoolAllocator,
-     TokenToKVPoolAllocator,
-@@ -97,10 +98,13 @@ from sglang.srt.mem_cache.memory_pool import (
-     HybridReqToTokenPool,
-     MHATokenToKVPool,
-     MLATokenToKVPool,
-+    MoEReqToTokenPool,
-+    MoETokenToKVPool,
-     NSATokenToKVPool,
-     ReqToTokenPool,
-     SWAKVPool,
- )
-+from sglang.srt.mem_cache.radix_cache import MoERadixCache
- from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
- from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
- from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-@@ -1803,6 +1807,32 @@ class ModelRunner:
+@@ -1919,6 +1919,36 @@ class ModelRunner:
          else:
              assert self.is_draft_worker
  
-+        self.moe_routing_cache = MoETokenToKVPool(  
++        self.moe_token_to_kv_pool = MHATokenToKVPool(  
 +            size=self.max_total_num_tokens,  
-+            page_size=self.page_size,  
-+            dtype=self.kv_cache_dtype,  
++            page_size=1,  
++            dtype=torch.float32,  
++            head_num=1,
++            head_dim=self.model_config.hf_config.num_experts_per_tok, 
 +            layer_num=self.num_effective_layers,  
 +            device=self.device,  
-+            num_experts_per_tok=self.model_config.hf_config.num_experts_per_tok,  
 +            enable_memory_saver=self.server_args.enable_memory_saver,  
 +            start_layer=self.start_layer,  
 +            end_layer=self.end_layer,  
-+        )
-+        self.moe_token_to_kv_pool_allocator = MoERoutingAllocator(  
++            enable_kv_cache_copy=(
++                self.server_args.speculative_algorithm is not None
++            ),
++            )            
++          
++        self.moe_token_to_kv_pool_allocator = TokenToKVPoolAllocator(  
 +            size=self.max_total_num_tokens,  
-+            page_size=self.page_size,  
 +            dtype=self.kv_cache_dtype,  
 +            device=self.device,  
-+            kvcache=self.moe_routing_cache,  
++            kvcache=self.moe_token_to_kv_pool,  
 +            need_sort=False,  
 +        )            
-+        self.moe_req_to_token_pool = MoEReqToTokenPool(  
++        self.moe_req_to_token_pool = ReqToTokenPool(  
 +            size=self.req_to_token_pool.size, 
 +            max_context_len=self.model_config.context_len,
 +            device=self.device,  
@@ -1590,23 +877,207 @@ index 34afad0..0027673 100644
              f"Memory pool end. "
              f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index 6faa408..e8e7e90 100644
+index 4209a3e..05725b6 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
-@@ -698,6 +698,16 @@ class DeepseekV2MoE(nn.Module):
-         use_reduce_scatter: bool = False,
-         gemm_output_zero_allocator: BumpAllocator = None,
-     ) -> torch.Tensor:
-+        router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-+        topk_output = self.topk(hidden_states, router_logits)
-+        # logger.info(f"{topk_output.topk_ids}")
-+        if forward_batch is not None and forward_batch.moe_routing_cache is not None :          
-+            forward_batch.moe_routing_cache.set_kv_buffer(  
-+                layer_id=self.layer_id,  
-+                loc=forward_batch.moe_routing_cache_loc,  
-+                cache_expert_indices=topk_output.topk_ids,  
-+                cache_routing_weights=topk_output.topk_weights,  
-+            )           
-         if not self._enable_a2a_moe:
-             DUAL_STREAM_TOKEN_THRESHOLD = 1024
-             if (
+@@ -747,21 +747,29 @@ class DeepseekV2MoE(nn.Module):
+                 and hidden_states.shape[0] > 0
+                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+             ):
+-                return self.forward_normal_dual_stream(
++                final_hidden_states, topk_output = self.forward_normal_dual_stream(
+                     hidden_states,
+                     should_allreduce_fusion,
+                     use_reduce_scatter,
+                     gemm_output_zero_allocator,
+                 )
+             else:
+-                return self.forward_normal(
++                final_hidden_states, topk_output = self.forward_normal(
+                     hidden_states,
+                     should_allreduce_fusion,
+                     use_reduce_scatter,
+                     gemm_output_zero_allocator,
+                 )
+         else:
+-            return self.forward_deepep(hidden_states, forward_batch)
++            final_hidden_states, topk_output = self.forward_deepep(hidden_states, forward_batch)
++
++        forward_batch.moe_token_to_kv_pool.set_kv_buffer(    
++            layer=self,    
++            loc=forward_batch.moe_out_cache_loc,    
++            cache_k=topk_output.topk_ids.unsqueeze(1),   
++            cache_v=topk_output.topk_weights.unsqueeze(1),   
++        )  
++        return final_hidden_states        
+ 
+     def forward_normal_dual_stream(
+         self,
+@@ -800,7 +808,7 @@ class DeepseekV2MoE(nn.Module):
+             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+-        return final_hidden_states
++        return final_hidden_states, topk_output
+ 
+     def forward_normal(
+         self,
+@@ -864,7 +872,7 @@ class DeepseekV2MoE(nn.Module):
+             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+         ):
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+-        return final_hidden_states
++        return final_hidden_states, topk_output
+ 
+     def forward_cpu(
+         self,
+@@ -979,7 +987,7 @@ class DeepseekV2MoE(nn.Module):
+             if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+                 final_hidden_states *= self.routed_scaling_factor
+ 
+-        return final_hidden_states
++        return final_hidden_states, topk_output
+ 
+     def _forward_shared_experts(
+         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
+diff --git a/run.py b/run.py
+new file mode 100644
+index 0000000..2455048
+--- /dev/null
++++ b/run.py
+@@ -0,0 +1,134 @@
++import asyncio
++import logging
++
++import multiprocessing
++import time
++from pydantic import BaseModel  
++from fastapi import FastAPI  
++
++import uvicorn
++import requests  
++from typing import List
++  
++logger = logging.getLogger(__name__)
++_server_process = None
++_server_started = False
++
++class BatchSetRequest(BaseModel):  
++    keys: List[str]  
++    data: List[List[float]]  
++  
++class BatchGetRequest(BaseModel):  
++    keys: List[str]  
++  
++class BatchExistsRequest(BaseModel):  
++    keys: List[str]  
++
++
++def _check_server_health(retries=3, delay=1):
++    for i in range(retries):
++        try:
++            response = requests.get("http://127.0.0.1:8000/health", timeout=5)
++            if response.status_code == 200:
++                return True
++        except requests.exceptions.RequestException:
++            if i < retries - 1:
++                time.sleep(delay)
++    return False
++
++def run_server():
++
++    try:
++        loop = asyncio.new_event_loop()
++        asyncio.set_event_loop(loop)
++        
++        app = FastAPI()
++        storage = {}
++        
++        @app.post("/batch_set")
++        async def batch_set(request : BatchSetRequest): 
++            results = []
++            for key, data in zip(request.keys, request.data):
++                storage[key] = data
++                print(data)
++            return {"results": results}
++        
++        @app.post("/batch_get")
++        async def batch_get(request: BatchGetRequest):  
++            data = [storage.get(key) for key in request.keys]
++            return {"data": data}
++        
++        @app.post("/batch_exists")
++        async def batch_exists(request :BatchExistsRequest): 
++            consecutive_hits = 0
++            for key in request.keys:
++                if key in storage:
++                    consecutive_hits += 1
++                else:
++                    break
++            return {"consecutive_hits": consecutive_hits}
++        
++        @app.get("/health")
++        async def health_check():
++            return {"status": "healthy"}
++        
++        config = uvicorn.Config(
++            app,
++            host="0.0.0.0",
++            port=8000,
++            loop="asyncio"
++        )
++        server = uvicorn.Server(config)
++        loop.run_until_complete(server.serve())
++    except Exception as e:
++        logger.error(f"Failed to start HTTP server in process: {e}")
++    finally:
++        if loop is not None:
++            loop.close()
++
++def _start_server():
++    global _server_process, _server_started
++    try:
++        if not _server_started:
++            _server_started = True
++            _server_process = multiprocessing.Process(
++                target=run_server,
++                daemon=True,
++                name="HiCache-HTTP-Server-Process"
++            )
++            
++            _server_process.start()
++            logger.info(f"Started HTTP server process with PID: {_server_process.pid}")
++            
++            for i in range(10):
++                time.sleep(0.5)
++                if _check_server_health(retries=1, delay=0.1):
++                    _server_started = True
++                    logger.info("HTTP server started successfully in separate process")
++                    break
++            else:
++                logger.error("HTTP server process failed to start within timeout")
++                if _server_process.is_alive():
++                    _server_process.terminate()
++                    _server_process.join(timeout=5)  
++                
++    except Exception as e:
++        logger.error(f"Error starting HTTP server process: {e}")
++        if _server_process and _server_process.is_alive():
++            _server_process.terminate()
++
++def stop_server():
++    global _server_process, _server_started
++    if _server_process and _server_process.is_alive():
++        logger.info("Stopping HTTP server process")
++        _server_process.terminate()
++        _server_process.join(timeout=10)   
++        if _server_process.is_alive():
++            logger.warning("Server process did not terminate gracefully, forcing kill")
++            _server_process.kill()   
++        _server_started = False
++        logger.info("HTTP server process stopped")
++
++
++if __name__ == "__main__":
++    run_server()
+\ No newline at end of file

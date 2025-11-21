@@ -1,9 +1,9 @@
 diff --git a/scripts/run-moonlight.sh b/scripts/run-moonlight.sh
 new file mode 100755
-index 0000000..e716693
+index 0000000..85c70e3
 --- /dev/null
 +++ b/scripts/run-moonlight.sh
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,216 @@
 +#!/bin/bash
 +
 +# for rerun the task
@@ -54,16 +54,17 @@ index 0000000..e716693
 +   # --rollout-shuffle
 +   --rm-type deepscaler
 +   --num-rollout 2
-+   --rollout-batch-size 1
++   --rollout-batch-size 20
 +   --n-samples-per-prompt 1
 +   --rollout-max-response-len 7800
 +   --rollout-temperature 0.8
 +
-+   --over-sampling-batch-size 1
++   --over-sampling-batch-size 20
 +   # --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
 +
 +   --num-steps-per-rollout 1
 +   --balance-data
++   # --use-tensorboard
 +)
 +
 +EVAL_ARGS=(
@@ -82,12 +83,12 @@ index 0000000..e716693
 +   --expert-model-parallel-size 1
 +   --expert-tensor-parallel-size 1
 +   # --decoder-last-pipeline-num-layers 9
-+   --recompute-granularity full
-+   --recompute-method uniform
-+   --recompute-num-layers 1
++   # --recompute-granularity full
++   # --recompute-method uniform
++   # --recompute-num-layers 1
 +
-+   --use-dynamic-batch-size
-+   --max-tokens-per-gpu 16384
++   # --use-dynamic-batch-size
++   # --max-tokens-per-gpu 16384
 +)
 +
 +GRPO_ARGS=(
@@ -107,8 +108,8 @@ index 0000000..e716693
 +   --weight-decay 0.1
 +   --adam-beta1 0.9
 +   --adam-beta2 0.98
-+   --num-layers 2
-+   --moe-layer-freq "[0,1]"
++   --num-layers 4
++   --moe-layer-freq "[0,1,1,1]"
 +   --optimizer-cpu-offload
 +   --overlap-cpu-optimizer-d2h-h2d
 +   --use-precision-aware-optimizer
@@ -150,6 +151,8 @@ index 0000000..e716693
 +)
 +
 +MISC_ARGS=(
++   --use-r3-cache 
++   --r3-cache-server-url http://localhost:8000 
 +   # default dropout in megatron is 0.1
 +   --attention-dropout 0.0
 +   --hidden-dropout 0.0
@@ -218,11 +221,106 @@ index 0000000..e716693
 +   ${MISC_ARGS[@]}
 +# fi
 \ No newline at end of file
+diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
+index 7480f2d..acd9661 100644
+--- a/slime/backends/megatron_utils/actor.py
++++ b/slime/backends/megatron_utils/actor.py
+@@ -120,7 +120,11 @@ class MegatronTrainRayActor(TrainRayActor):
+             self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
+ 
+         self.prof = TrainProfiler(args)
+-
++        if self.args.use_r3_cache:  
++            from slime.utils.rollout_routing_replay import get_or_create_r3_cache  
++            self.r3_cache = get_or_create_r3_cache(  
++                cache_server_url=os.environ.get("R3_CACHE_SERVER_URL", "http://0.0.0.0:8000")  
++            )  
+         return start_rollout_id
+ 
+     @torch.no_grad()
+@@ -254,6 +258,25 @@ class MegatronTrainRayActor(TrainRayActor):
+     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+         # Create data iterator for log_probs and train.
+         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
++        if self.args.use_r3_cache:  
++            with timer("fetch data"):    
++                from slime.backends.megatron_utils.data import get_batch    
++                original_offset = data_iterator[0].offset    
++                num_steps_per_rollout = len(num_microbatches)  
++                for step_id in range(num_steps_per_rollout):  
++                    for mb_id in range(num_microbatches[step_id]):  
++                        batch = get_batch(data_iterator[0], ["tokens"])  
++                        padded_tokens = batch["tokens"]  # [1, T_padded]  
++                        success = self.r3_cache.prefetch_all_layers(  
++                            padded_tokens.squeeze(0).tolist(),  # 转换为 1D list  
++                            self.model[0].config,  
++                        )  
++                        if not success:  
++                            print("⚠️ R3 Cache prefetch failed")  
++                            break  
++                    if not success:  
++                        break  
++                data_iterator[0].offset = original_offset
+ 
+         with inverse_timer("train_wait"), timer("train"):
+             if self.args.compute_advantages_and_returns:
+@@ -301,7 +324,8 @@ class MegatronTrainRayActor(TrainRayActor):
+             log_rollout_data(rollout_id, self.args, rollout_data)
+ 
+             # Train
+-            if self.args.use_routing_replay:
++            # if self.args.use_routing_replay:
++            if True or self.args.use_r3:
+                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+             with timer("actor_train"):
+                 train(
+@@ -317,6 +341,9 @@ class MegatronTrainRayActor(TrainRayActor):
+ 
+         train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
+ 
++        from slime.utils.rollout_routing_replay import RolloutRoutingReplayCache  
++        RolloutRoutingReplayCache.clear_all()          
++
+         if self.args.use_routing_replay:
+             RoutingReplay.clear_all()
+ 
 diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
-index afc6bef..e9a667e 100644
+index afc6bef..4d3dec3 100644
 --- a/slime/utils/arguments.py
 +++ b/slime/utils/arguments.py
-@@ -1432,6 +1432,7 @@ def hf_validate_args(args, hf_config):
+@@ -595,7 +595,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+             parser.add_argument("--eval-min-new-tokens", type=int, default=None)
+ 
+             return parser
+-
++        
++        def add_r3_cache_arguments(parser):  
++            """Add arguments for R3 (Rollout Routing Replay) Cache"""  
++            parser.add_argument(  
++                "--use-r3-cache",  
++                action="store_true",  
++                default=False,  
++                help="Enable R3 (Rollout Routing Replay) cache for MoE routing decisions"  
++            )  
++            parser.add_argument(  
++                "--r3-cache-server-url",  
++                type=str,  
++                default="http://0.0.0.0:8000",  
++                help="URL of the R3 cache server for storing/retrieving routing decisions"  
++            )  
++            return parser
+         def add_algo_arguments(parser):
+             parser.add_argument(
+                 "--ref-load",
+@@ -1117,6 +1132,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+         parser = add_rollout_buffer_arguments(parser)
+         parser = add_mtp_training_arguments(parser)
+         parser = add_ci_arguments(parser)
++        parser = add_r3_cache_arguments(parser)
+         parser.set_defaults(sglang_tensor_parallel_size=add_sglang_tp_size())
+ 
+         # For megatron
+@@ -1432,6 +1448,7 @@ def hf_validate_args(args, hf_config):
          ("rope_theta", "rotary_base", equal),
      ]:
          if hasattr(hf_config, hf_config_name):
@@ -243,17 +341,39 @@ index 2d35fc8..15a15b2 100644
                      metadata=data.get(metadata_key) or {},
                  )
              )
+diff --git a/slime/utils/reloadable_process_group.py b/slime/utils/reloadable_process_group.py
+index 1583ed8..24ada70 100644
+--- a/slime/utils/reloadable_process_group.py
++++ b/slime/utils/reloadable_process_group.py
+@@ -124,6 +124,8 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
+     @staticmethod
+     def destroy_process_groups():
+         pid = os.getpid()
++        if pid not in ReloadableProcessGroup.GROUPS:
++            return
+         for reloadable_group in ReloadableProcessGroup.GROUPS[pid]:
+             if reloadable_group.group is None:
+                 continue
+@@ -135,6 +137,8 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
+     @staticmethod
+     def reload_process_groups():
+         pid = os.getpid()
++        if pid not in ReloadableProcessGroup.GROUPS:  
++            return                 
+         print(f"Reloading {len(ReloadableProcessGroup.GROUPS[pid])} process groups in pid {pid}", flush=True)
+         old_new_group = old_new_group_dict[pid]
+         for reloadable_group in ReloadableProcessGroup.GROUPS[pid]:
 diff --git a/slime/utils/rollout_routing_replay.py b/slime/utils/rollout_routing_replay.py
 new file mode 100644
-index 0000000..b978881
+index 0000000..5676887
 --- /dev/null
 +++ b/slime/utils/rollout_routing_replay.py
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,157 @@
 +import os  
 +import hashlib  
 +import requests  
 +import torch  
-+from typing import Optional, Tuple, List  
++from typing import Optional, Tuple, List, Dict  
 +  
 +ROLLOUT_ROUTING_REPLAY_CACHE = None  
 +  
@@ -262,24 +382,27 @@ index 0000000..b978881
 +    global ROLLOUT_ROUTING_REPLAY_CACHE  
 +    ROLLOUT_ROUTING_REPLAY_CACHE = cache  
 +  
-+  
 +class RolloutRoutingReplayCache:  
-+    all_routing_cache = []  
-+  
++    _instance = None  
++      
++    def __new__(cls, cache_server_url="http://0.0.0.0:8000"):  
++        if cls._instance is None:  
++            cls._instance = super().__new__(cls)  
++            cls._instance._initialized = False  
++        return cls._instance  
++      
 +    def __init__(self, cache_server_url="http://0.0.0.0:8000"):  
++        if self._initialized:  
++            return  
 +        self.cache_server_url = cache_server_url  
-+        self.token_ids = None  
-+        self.layer_number = None  
 +        self.config = None  
-+        RolloutRoutingReplayCache.all_routing_cache.append(self)  
-+  
-+    def set_token_ids(self, 
-+                      token_ids: List[int]):  
-+        self.token_ids = token_ids  
-+  
-+    def _compute_hash_key(self, 
-+                          token_ids: List[int], 
-+                          prior_hash: Optional[str] = None) -> str:  
++          
++        self.prefetched_data = {}  
++        self.current_layer = None
++        self.pop_count = 0
++        self._initialized = True  
++      
++    def _compute_hash_key(self, token_ids: List[int], prior_hash: Optional[str] = None) -> str:  
 +        hasher = hashlib.sha256()  
 +        if prior_hash:  
 +            hasher.update(bytes.fromhex(prior_hash))  
@@ -288,103 +411,119 @@ index 0000000..b978881
 +            hasher.update(int(t).to_bytes(4, byteorder="little", signed=False))  
 +          
 +        return hasher.hexdigest()  
-+  
-+    def query_cache(self, 
-+                    layer_number: int, 
-+                    config) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:  
-+        if self.token_ids is None:  
-+            return None, None  
-+          
-+        self.layer_number = layer_number  
++      
++    def prefetch_all_layers(self, token_ids: List[int], config) -> bool:  
 +        self.config = config  
-+          
 +        last_hash = None  
 +        hash_keys = []  
-+        for token_id in self.token_ids:  
++        for token_id in token_ids:  
 +            last_hash = self._compute_hash_key([token_id], prior_hash=last_hash)  
 +            hash_keys.append(last_hash)  
-+          
++        
 +        try:  
 +            response = requests.post(  
 +                f"{self.cache_server_url}/batch_get",  
 +                json={"keys": hash_keys},  
-+                timeout=5  
++                timeout=10  
 +            )  
-+                
-+            data_list = response.json().get("data", [])                
-+            if not data_list:
-+                return None, None
-+                
-+            valid_count = sum(1 for data in data_list if data is not None)
-+            if valid_count == 0:
-+                return None, None
-+                
++            
++            data_list = response.json().get("data", [])  
++            if not data_list:  
++                return False  
++            
++            num_layers = config.num_layers  
++            topk = config.moe_router_topk  
++            
 +            template_data = next((data for data in data_list if data is not None), None)
 +            if template_data is None:
-+                return None, None
-+                
-+            num_tokens = len(data_list)
-+            half_len = len(template_data) // 2
-+            num_layers = half_len // config.moe_router_topk
-+            layer_idx = layer_number - 1
++                return None, None      
++            for layer_id in range(1, num_layers + 1):
++                if layer_id not in self.prefetched_data:
++                    from collections import deque
++                    self.prefetched_data[layer_id] = deque()
++                batch_ids = torch.zeros(  
++                    (len(token_ids), topk),  
++                    dtype=torch.int64,  
++                    device="cpu",  
++                    pin_memory=True  
++                )  
++                batch_weights = torch.zeros(  
++                    (len(token_ids), topk),  
++                    dtype=torch.float32,  
++                    device="cpu",  
++                    pin_memory=True  
++                )  
++                none_num = 0
++                for i,  data in enumerate(data_list):  
++                    if data is None or set(data) == {0}:
++                        data = template_data
++                        none_num = none_num + 1
++                    ids_start = (layer_id - 1) * topk  
++                    ids_end = ids_start + topk  
++                    expert_ids = data[ids_start:ids_end]  
++                    
++                    weights_start = num_layers * topk + (layer_id - 1) * topk  
++                    weights_end = weights_start + topk  
++                    expert_weights = data[weights_start:weights_end]  
++                    
++                    batch_ids[i] = torch.tensor(expert_ids, dtype=torch.int64)  
++                    batch_weights[i] = torch.tensor(expert_weights, dtype=torch.float32)  
++                print(f"cache hit rate: {(len(data_list)-none_num)}/{len(data_list)} {(len(data_list)-none_num)/len(data_list)}")
++                self.prefetched_data[layer_id].append((batch_weights, batch_ids))  
++            return True  
 +            
-+            layer_weights = torch.empty((num_tokens, config.moe_router_topk), dtype=torch.float32, device=torch.cuda.current_device())
-+            layer_ids = torch.empty((num_tokens, config.moe_router_topk), dtype=torch.int64, device=torch.cuda.current_device())
-+            
-+            for i, data in enumerate(data_list):
-+                if data is None or set(data) == {0}:
-+                    data = template_data
-+                start_idx = layer_idx * config.moe_router_topk
-+                end_idx = start_idx + config.moe_router_topk
-+                weights_start = half_len + start_idx
-+                weights_end = half_len + end_idx
-+                
-+                layer_ids[i] = torch.tensor(data[start_idx:end_idx], dtype=torch.int64, device=layer_ids.device)
-+                layer_weights[i] = torch.tensor(data[weights_start:weights_end], dtype=torch.float32, device=layer_weights.device)
-+        
-+            return layer_weights, layer_ids 
 +        except Exception as e:  
-+            print(f"Error querying R3 routing cache: {e}")  
-+            return None, None  
-+  
++            print(f"❌ R3 Cache prefetch failed: {e}")  
++            import traceback  
++            traceback.print_exc()  
++            return False 
++
++
++    def pop_backward(self, layer_id):          
++        self.pop_count = self.pop_count + 1
++        batch_weights, batch_ids = self.prefetched_data[layer_id].popleft()  
++        return (  
++            batch_weights.to(torch.cuda.current_device()),  
++            batch_ids.to(torch.cuda.current_device())  
++        )  
++      
++    def clear_forward(self):  
++        for layer_id in self.forward_indices:  
++            self.forward_indices[layer_id] = 0  
++      
++    def clear(self):  
++        self.prefetched_data.clear()  
++      
 +    @staticmethod  
 +    def clear_all():  
-+        for cache in RolloutRoutingReplayCache.all_routing_cache:  
-+            cache.token_ids = None  
-+  
-+  
++        if ROLLOUT_ROUTING_REPLAY_CACHE is not None:  
++            ROLLOUT_ROUTING_REPLAY_CACHE.clear()  
++
 +def get_r3_cache_compute_topk(old_compute_topk):  
 +    def compute_topk(scores, topk, num_groups=None, group_topk=None):  
-+        import os  
 +        if os.environ.get("ENABLE_R3_CACHE", "1") == "1":  
-+            if ROLLOUT_ROUTING_REPLAY_CACHE is not None:  
-+                cached_probs, cached_top_indices = ROLLOUT_ROUTING_REPLAY_CACHE.query_cache(  
-+                    layer_number=getattr(ROLLOUT_ROUTING_REPLAY_CACHE, 'current_layer', 0),  
-+                    config=getattr(ROLLOUT_ROUTING_REPLAY_CACHE, 'config', None)  
-+                )  
-+                if cached_probs is not None and cached_top_indices is not None:  
-+                    a,b = old_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk) 
-+                    print(f"✅ R3 Cache hit for layer {ROLLOUT_ROUTING_REPLAY_CACHE.current_layer}")  
-+                    return cached_probs, cached_top_indices  
++            r3_stage = os.environ.get("ROUTING_REPLAY_STAGE", "fallthrough")  
++            layer_id = getattr(ROLLOUT_ROUTING_REPLAY_CACHE, 'current_layer', None) 
 +
-+        
++            if r3_stage == "replay_backward":
++                probs, top_indices = ROLLOUT_ROUTING_REPLAY_CACHE.pop_backward(layer_id)  
++                return probs, top_indices  
 +        return old_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)  
-+      
 +    return compute_topk  
 +  
 +  
-+def register_r3_cache(module, cache_server_url="http://0.0.0.0:8000"):  
-+    if os.environ.get("ENABLE_R3_CACHE", "1") == "1":  
-+        module.r3_cache = RolloutRoutingReplayCache(cache_server_url)  
++def get_or_create_r3_cache(cache_server_url="http://0.0.0.0:8000"):  
++    global ROLLOUT_ROUTING_REPLAY_CACHE  
++    if ROLLOUT_ROUTING_REPLAY_CACHE is None:  
++        ROLLOUT_ROUTING_REPLAY_CACHE = RolloutRoutingReplayCache(cache_server_url)  
++    return ROLLOUT_ROUTING_REPLAY_CACHE  
 +  
++  
++def register_r3_cache(module, cache_server_url="http://0.0.0.0:8000"):  
++    if os.environ.get("ENABLE_R3_CACHE", "0") == "1":  
++        module.r3_cache = get_or_create_r3_cache(cache_server_url)  
 +        def pre_forward_hook(module, input):  
 +            set_r3_cache(module.r3_cache)  
-+            from megatron.core.moe.cache_context import MoECacheContext  
-+            token_ids = MoECacheContext.get_input_ids()  
-+            if token_ids is not None:  
-+                module.r3_cache.set_token_ids(token_ids)  
 +            module.r3_cache.current_layer = module.layer_number  
-+            module.r3_cache.config = module.config  
-+  
 +        module.register_forward_pre_hook(pre_forward_hook)
 \ No newline at end of file
