@@ -181,7 +181,7 @@ index 7d2c01b31..49f84005c 100755
      ${MODEL_PARALLEL_ARGS[@]} \
      ${DATA_ARGS[@]} \
 diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gpt_model.py
-index 7aa4b2f7d..948535586 100644
+index 6ca48b55f..427c9a134 100644
 --- a/megatron/core/models/gpt/gpt_model.py
 +++ b/megatron/core/models/gpt/gpt_model.py
 @@ -367,6 +367,8 @@ class GPTModel(LanguageModule):
@@ -221,34 +221,6 @@ index 000000000..3300d6738
 +        """Clear context after forward pass"""  
 +        cls._thread_local.input_ids = None
 \ No newline at end of file
-diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
-index fbcffe278..74c038864 100644
---- a/megatron/core/transformer/moe/moe_utils.py
-+++ b/megatron/core/transformer/moe/moe_utils.py
-@@ -569,6 +569,9 @@ def topk_routing_with_score_function(
-     from slime.utils.routing_replay import get_routing_replay_compute_topk
-     compute_topk = get_routing_replay_compute_topk(compute_topk)
- 
-+    from slime.utils.rollout_routing_replay import get_r3_cache_compute_topk  
-+    compute_topk = get_r3_cache_compute_topk(compute_topk)  
-+
-     if score_function == "softmax":
-         if use_pre_softmax:
-             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
-diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
-index 459e65921..a7586d973 100644
---- a/megatron/core/transformer/moe/router.py
-+++ b/megatron/core/transformer/moe/router.py
-@@ -159,6 +159,9 @@ class TopKRouter(Router):
-         from slime.utils.routing_replay import register_routing_replay
-         register_routing_replay(self)
- 
-+        from slime.utils.rollout_routing_replay import register_r3_cache  
-+        register_r3_cache(self, cache_server_url="http://0.0.0.0:8000")        
-+
-     def _maintain_float32_expert_bias(self):
-         """
-         Maintain the expert bias in float32.
 diff --git a/megatron/training/checkpointing.py b/megatron/training/checkpointing.py
 index c15c05196..812dbf437 100644
 --- a/megatron/training/checkpointing.py

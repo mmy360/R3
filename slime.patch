@@ -1,140 +1,358 @@
-diff --git a/scripts/run-moonlight.sh b/scripts/run-moonlight.sh
-new file mode 100755
-index 0000000..85c70e3
+diff --git a/run.py b/run.py
+new file mode 100644
+index 0000000..1c4451e
 --- /dev/null
-+++ b/scripts/run-moonlight.sh
-@@ -0,0 +1,216 @@
-+#!/bin/bash
++++ b/run.py
+@@ -0,0 +1,192 @@
++import asyncio, logging, multiprocessing, time
++from typing import Any, Dict
++from starlette.applications import Starlette
++from starlette.responses import JSONResponse, Response
++from starlette.routing import Route
++import uvicorn
++import orjson
 +
-+# for rerun the task
-+pkill -9 sglang
-+sleep 3
-+ray stop --force
-+pkill -9 ray
-+pkill -9 python
-+sleep 3
-+pkill -9 ray
-+pkill -9 python
++def loads(b: bytes) -> Any: return orjson.loads(b)
++def dumps(obj: Any) -> bytes: return orjson.dumps(obj)
 +
-+set -ex
++logger = logging.getLogger("srv")
++logging.basicConfig(level=logging.CRITICAL)
 +
-+# will prevent ray from buffering stdout/stderr
++_server_process = None
++_server_started = False
++
++class IdleMonitor:
++    def __init__(self, idle_timeout: float = 10.0):
++        self.idle_timeout = idle_timeout
++        self.last_request_time = time.time()
++        self.is_idle = False
++        self._task = None
++        self._event = asyncio.Event()
++        self._lock = asyncio.Lock()
++
++    def update_activity(self):
++        self.last_request_time = time.time()
++        if self.is_idle: self.is_idle = False
++        self._event.set()
++
++    async def monitor_idle(self):
++        while True:
++            try:
++                await asyncio.wait_for(self._event.wait(), timeout=self.idle_timeout)
++                self._event.clear()
++                if self.is_idle: self.is_idle = False
++            except asyncio.TimeoutError:
++                async with self._lock:
++                    if time.time() - self.last_request_time >= self.idle_timeout:
++                        if not self.is_idle: self.is_idle = True
++
++    def start_monitoring(self):
++        if self._task is None:
++            self._task = asyncio.create_task(self.monitor_idle())
++
++    def get_status(self):
++        return {
++            "is_idle": self.is_idle,
++            "idle_duration": round(time.time() - self.last_request_time, 2),
++            "idle_timeout": self.idle_timeout,
++            "last_request_time": round(self.last_request_time, 3)
++        }
++
++def _check_server_health(retries=3, delay=1.0) -> bool:
++    import requests
++    for _ in range(retries):
++        try:
++            if requests.get("http://127.0.0.1:8000/health", timeout=2).status_code == 200:
++                return True
++        except:
++            time.sleep(delay)
++    return False
++
++def _create_app(idle_timeout: float = 10.0) -> Starlette:
++    app = Starlette()
++    app.state.storage: Dict[str, Any] = {}
++    app.state.storage_lock = asyncio.Lock()
++    app.state.idle_monitor = IdleMonitor(idle_timeout)
++
++    async def startup():
++        app.state.idle_monitor.start_monitoring()
++    app.add_event_handler("startup", startup)
++
++    async def health(request):
++        return JSONResponse({"status": "healthy"})
++    app.add_route("/health", health, methods=["GET"])
++
++    async def idle_status(request):
++        return JSONResponse(app.state.idle_monitor.get_status())
++    app.add_route("/idle_status", idle_status, methods=["GET"])
++
++    async def batch_set(request):
++        app.state.idle_monitor.update_activity()
++        body = await request.body()
++        if not body:
++            return Response(content=dumps({"error": "empty"}), status_code=400, media_type="application/json")
++        try:
++            req = loads(body)
++            keys = req.get("keys", [])
++            data = req.get("data", [])
++        except:
++            return Response(content=dumps({"error": "invalid"}), status_code=400, media_type="application/json")
++        n = min(len(keys), len(data))
++        if n == 0: return {"results": []}
++        async with app.state.storage_lock:
++            for i in range(n): app.state.storage[keys[i]] = data[i]
++        return JSONResponse({"results": [{"key": keys[i], "ok": True} for i in range(n)]})
++
++    async def batch_get(request):
++        app.state.idle_monitor.update_activity()
++        body = await request.body()
++        if not body:
++            return Response(content=dumps({"error": "empty"}), status_code=400, media_type="application/json")
++        try:
++            req = loads(body)
++            keys = req.get("keys", [])
++        except:
++            return Response(content=dumps({"error": "invalid"}), status_code=400, media_type="application/json")
++        storage = app.state.storage
++        return JSONResponse({"data": [storage.get(k) for k in keys]})
++
++    async def batch_exists(request):
++        app.state.idle_monitor.update_activity()
++        body = await request.body()
++        if not body:
++            return Response(content=dumps({"error": "empty"}), status_code=400, media_type="application/json")
++        try:
++            req = loads(body)
++            keys = req.get("keys", [])
++        except:
++            return Response(content=dumps({"error": "invalid"}), status_code=400, media_type="application/json")
++        storage = app.state.storage
++        c = 0
++        for k in keys:
++            if k in storage: c += 1
++            else: break
++        return JSONResponse({"consecutive_hits": c})
++
++    async def clear_cache(request):
++        async with app.state.storage_lock:
++            app.state.storage.clear()
++        return JSONResponse({"status": "cleared"})
++        
++
++    app.add_route("/batch_set", batch_set, methods=["POST"])
++    app.add_route("/batch_get", batch_get, methods=["POST"])
++    app.add_route("/batch_exists", batch_exists, methods=["POST"])
++    app.add_route("/clear_cache", clear_cache, methods=["POST"])
++    
++    return app
++
++def run_server(host="0.0.0.0", port=8000, idle_timeout=10.0):
++    try:
++        import uvloop
++        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
++    except:
++        pass
++    app = _create_app(idle_timeout)
++    config = uvicorn.Config(
++        app,
++        host=host,
++        port=port,
++        loop="asyncio",
++        workers=1,
++        lifespan="on",
++        access_log=False,
++        log_level="critical",
++        backlog=1048576
++    )
++    uvicorn.Server(config).run()
++
++def _start_server():
++    global _server_process, _server_started
++    if not _server_started:
++        _server_started = True
++        _server_process = multiprocessing.Process(
++            target=run_server,
++            daemon=True,
++            name="HiCache-HTTP-Server-Process",
++            kwargs={"host": "127.0.0.1", "port": 8000, "idle_timeout": 10.0}
++        )
++        _server_process.start()
++        for _ in range(10):
++            time.sleep(0.5)
++            if _check_server_health(retries=1, delay=0.1):
++                break
++        else:
++            if _server_process.is_alive():
++                _server_process.terminate()
++                _server_process.join(5)
++
++def stop_server():
++    global _server_process, _server_started
++    if _server_process and _server_process.is_alive():
++        _server_process.terminate()
++        _server_process.join(10)
++        if _server_process.is_alive(): _server_process.kill()
++        _server_started = False
++
++if __name__ == "__main__":
++    run_server()
+diff --git a/scripts/run-moonlight-16B-A3B.sh b/scripts/run-moonlight-16B-A3B.sh
+old mode 100644
+new mode 100755
+index fc5afd5..df99878
+--- a/scripts/run-moonlight-16B-A3B.sh
++++ b/scripts/run-moonlight-16B-A3B.sh
+@@ -9,12 +9,15 @@ pkill -9 python
+ sleep 3
+ pkill -9 ray
+ pkill -9 python
+-pkill -9 redis
+ 
+ set -ex
+ 
+ # will prevent ray from buffering stdout/stderr
+-export PYTHONBUFFERED=16
 +export PYTHONBUFFERED=0
 +export CUDNN_LOGERR_DBG=1
 +
-+
-+NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
-+if [ "$NVLINK_COUNT" -gt 0 ]; then
-+    HAS_NVLINK=1
-+else
-+    HAS_NVLINK=0
-+fi
-+echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
-+
-+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-+source "${SCRIPT_DIR}/models/moonlight.sh"
-+
-+CKPT_ARGS=(
-+   --hf-checkpoint /afs/chatrl/public/models/Moonlight-16B-A3B
++export LOG_FILE="./server_$(date +'%Y%m%d_%H%M%S').log"
++python run.py > "$LOG_FILE" 2>&1 &
+ 
+ NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+ if [ "$NVLINK_COUNT" -gt 0 ]; then
+@@ -28,57 +31,60 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+ source "${SCRIPT_DIR}/models/moonlight.sh"
+ 
+ CKPT_ARGS=(
+-   --hf-checkpoint /root/Moonlight-16B-A3B
+-   --ref-load /root/Moonlight-16B-A3B_torch_dist
+-   --load /root/Moonlight-16B-A3B_slime/
+-   --save /root/Moonlight-16B-A3B_slime/
+-   --save-interval 20
++   --hf-checkpoint /gemini-0/platform/public/Moonlight-16B-A3B-Instruct
 +   #--hf-checkpoint $BASE_DIR/DeepSeek-R1-bf16/
-+   --ref-load /afs/chatrl/public/models/Moonlight-16B-A3B_torch_dist
-+   --load /afs/chatrl/public/models/Moonlight-16B-A3B_torch_dist
-+   --save $BASE_DIR/DeepSeek-R1_slime/
-+   --save-interval 20
-+)
-+
-+ROLLOUT_ARGS=(
-+   --prompt-data /afs/chatrl/users/wxe/slime/data/DAPO-Math-17k.jsonl
-+   --input-key prompt
++   --ref-load /gemini-0/platform/public/Moonlight-16B-A3B-Instruct-torch-dist
++   --load /gemini-0/platform/public/Moonlight-16B-A3B-Instruct_torch_dist
++   # --save $BASE_DIR/DeepSeek-R1_slime/
++   # --save-interval 20
+ )
+ 
+ ROLLOUT_ARGS=(
+-   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
++   --prompt-data /gemini-0/platform/public/slime/data/DAPO-Math-17k.jsonl
+    --input-key prompt
+-   --label-key label
 +   --label-key ground_truth
 +   # --tokenizer-type TikTokenizer
 +   # --tiktoken-pattern v2
 +   # --tokenizer-model /gemini/space/infra/wxe/Moonlight-16B-A3B/tokenizer_config.json
-+   --apply-chat-template
+    --apply-chat-template
+-   --rollout-shuffle
+-   --rm-type math
+-   --num-rollout 3000
+-   --rollout-batch-size 128
+-   --n-samples-per-prompt 8
+-   --rollout-max-response-len 4096
 +   # --rollout-shuffle
 +   --rm-type deepscaler
-+   --num-rollout 2
-+   --rollout-batch-size 20
-+   --n-samples-per-prompt 1
++   --num-rollout 10
++   --rollout-batch-size 1
++   --n-samples-per-prompt 128
 +   --rollout-max-response-len 7800
-+   --rollout-temperature 0.8
-+
-+   --over-sampling-batch-size 20
+    --rollout-temperature 0.8
++   --use-rollout-routing-replay 
++   # --use-slime-router
++   --over-sampling-batch-size 128
 +   # --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
-+
+ 
+-   --over-sampling-batch-size 256
+-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+-
+-   --num-steps-per-rollout 4
+-   # --global-batch-size 256
+-   --balance-data   
 +   --num-steps-per-rollout 1
 +   --balance-data
-+   # --use-tensorboard
-+)
-+
-+EVAL_ARGS=(
-+   --eval-interval 20
-+   --eval-prompt-data dapo /afs/chatrl/users/wxe/slime/data/DAPO-Math-17k.jsonl
-+   --n-samples-per-eval-prompt 8
-+   --eval-max-response-len 4096
-+   --eval-top-p 0.7
-+)
-+
-+PERF_ARGS=(
+ )
+ 
+-EVAL_ARGS=(
+-   --eval-interval 20
+-   --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
+-   --n-samples-per-eval-prompt 8
+-   --eval-max-response-len 4096
+-   --eval-top-p 0.7
+-)
++# EVAL_ARGS=(
++#    --eval-interval 20
++#    --eval-prompt-data dapo /afs/chatrl/users/wxe/slime/data/DAPO-Math-17k.jsonl
++#    --n-samples-per-eval-prompt 8
++#    --eval-max-response-len 4096
++#    --eval-top-p 0.7
++# )
+ 
+ PERF_ARGS=(
+-   --tensor-model-parallel-size 4
+-   --sequence-parallel
+-   --pipeline-model-parallel-size 1
 +   --tensor-model-parallel-size 1
-+   --sequence-parallel
-+   --pipeline-model-parallel-size 1
-+   --context-parallel-size 1
++   # --sequence-parallel
++   --pipeline-model-parallel-size 8
+    --context-parallel-size 1
+-   --expert-model-parallel-size 8
 +   --expert-model-parallel-size 1
-+   --expert-tensor-parallel-size 1
-+   # --decoder-last-pipeline-num-layers 9
+    --expert-tensor-parallel-size 1
++   --decoder-last-pipeline-num-layers 6
 +   # --recompute-granularity full
 +   # --recompute-method uniform
 +   # --recompute-num-layers 1
-+
+ 
+-   --recompute-granularity full
+-   --recompute-method uniform
+-   --recompute-num-layers 1
+-
+-   # --micro-batch-size 1
+-   --use-dynamic-batch-size
+-   --max-tokens-per-gpu 8192
 +   # --use-dynamic-batch-size
 +   # --max-tokens-per-gpu 16384
-+)
-+
-+GRPO_ARGS=(
-+   --advantage-estimator grpo
-+   --use-kl-loss
-+   --kl-loss-coef 0.00
-+   --kl-loss-type low_var_kl
-+   --entropy-coef 0.00
-+   --eps-clip 0.2
-+   --eps-clip-high 0.28
-+)
-+
-+OPTIMIZER_ARGS=(
-+   --optimizer adam
-+   --lr 1e-6
-+   --lr-decay-style constant
-+   --weight-decay 0.1
-+   --adam-beta1 0.9
-+   --adam-beta2 0.98
-+   --num-layers 4
-+   --moe-layer-freq "[0,1,1,1]"
-+   --optimizer-cpu-offload
-+   --overlap-cpu-optimizer-d2h-h2d
-+   --use-precision-aware-optimizer
-+)
-+
-+WANDB_ARGS=(
-+   # --use-wandb
-+   # --wandb-project slime-dev
+ )
+ 
+ GRPO_ARGS=(
+@@ -98,7 +104,6 @@ OPTIMIZER_ARGS=(
+    --weight-decay 0.1
+    --adam-beta1 0.9
+    --adam-beta2 0.98
+-
+    --optimizer-cpu-offload
+    --overlap-cpu-optimizer-d2h-h2d
+    --use-precision-aware-optimizer
+@@ -107,14 +112,39 @@ OPTIMIZER_ARGS=(
+ WANDB_ARGS=(
+    # --use-wandb
+    # --wandb-project slime-dev
+-   # --wandb-group moomlight-16B-A3B-test
 +   # --wandb-group deepseek-r1-test
-+   # --wandb-key ${WANDB_KEY}
-+)
-+
-+SGLANG_ARGS=(
-+   --rollout-num-gpus-per-engine 1
+    # --wandb-key ${WANDB_KEY}
++   --use-tensorboard
++   --tb-project-name R3   
++   --tb-experiment-name noR3
+ )
+ 
+ SGLANG_ARGS=(
+    --rollout-num-gpus-per-engine 8
+-   --sglang-mem-fraction-static 0.7
+-   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 +   --sglang-mem-fraction-static 0.8
 +
 +   # dp attention
 +   # --sglang-enable-dp-attention
-+   --sglang-enable-tokenizer-batch-encode
++   # --sglang-enable-tokenizer-batch-encode 
 +   # --sglang-disable-cuda-graph
 +   --sglang-dp-size 1
-+   --sglang-tp-size 1
++   --sglang-tp-size 8
 +   --sglang-ep-size 1
-+   --sglang-moe-dense-tp-size 1
-+   --sglang-enable-dp-lm-head
++   # --sglang-moe-dense-tp-size 1
++   # --sglang-enable-dp-lm-head
 +   --sglang-disable-radix-cache
 +   # --sglang-log-requests-level 3
 +   # --sglang-log-requests
@@ -147,36 +365,45 @@ index 0000000..85c70e3
 +   # --sglang-deepep-mode auto
 +
 +   # make every dp rank has 128 concurrency
-+   --sglang-server-concurrency 1024
-+)
-+
-+MISC_ARGS=(
-+   --use-r3-cache 
-+   --r3-cache-server-url http://localhost:8000 
-+   # default dropout in megatron is 0.1
-+   --attention-dropout 0.0
-+   --hidden-dropout 0.0
-+   # should be good for model performance
-+   --accumulate-allreduce-grads-in-fp32
-+   --attention-softmax-in-fp32
-+   # --trust-remote-code
-+   # need to comment this when using model with MLA
++   --sglang-server-concurrency 128
+ )
+ 
+ MISC_ARGS=(
+@@ -125,28 +155,49 @@ MISC_ARGS=(
+    --accumulate-allreduce-grads-in-fp32
+    --attention-softmax-in-fp32
+    # need to comment this when using model with MLA
+-   # --attention-backend flash
 +   --attention-backend flash
 +   # --debug-rollout-only
 +
-+
-+   # use deepep for megatron
+ 
+    # use deepep for megatron
+-   --moe-enable-deepep
+-   --moe-token-dispatcher-type flex
 +   # --moe-enable-deepep
 +   # --moe-token-dispatcher-type flex
 +   # --use-routing-replay
 +   # --debug-rollout-only
-+)
-+
-+# launch the master node of ray in container
+ )
+ 
+ # launch the master node of ray in container
+-export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+-
+-# Build the runtime environment JSON with proper variable substitution
+-RUNTIME_ENV_JSON="{
+-  \"env_vars\": {
+-    \"PYTHONPATH\": \"/root/Megatron-LM/\",
+-    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
+-  }
+-}"
+-
 +export no_proxy="127.0.0.1,${GEMINI_HOST_IP_taskrole1_0}"
 +ray start --head \
 +    --node-ip-address "127.0.0.1" \
-+    --num-gpus 1 \
++    --num-gpus 8 \
 +    --disable-usage-stats \
 +    --dashboard-host=0.0.0.0 \
 +    --dashboard-port=8265
@@ -191,7 +418,8 @@ index 0000000..85c70e3
 +#     ray start --address "${GEMINI_HOST_IP_taskrole1_0}:6379" --num-gpus 8 --disable-usage-stats
 +# fi
 +# if [ "$GEMINI_CURRENT_TASK_ROLE_CURRENT_TASK_INDEX" -eq 0 ]; then
-+ray job submit --address="http://127.0.0.1:8265" \
+ ray job submit --address="http://127.0.0.1:8265" \
+-   --runtime-env-json="${RUNTIME_ENV_JSON}" \
 +   --runtime-env-json='{
 +   "env_vars": {
 +      "no_proxy": "localhost,127.0.0.1,0.0.0.0",
@@ -204,326 +432,266 @@ index 0000000..85c70e3
 +      "LD_LIBRARY_PATH": "/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/sgl-workspace/nvshmem/install/lib/"
 +   }
 +   }' \
-+   -- python3 train.py \
-+   --actor-num-nodes 1 \
-+   --actor-num-gpus-per-node 1 \
-+   --colocate \
-+   ${MODEL_ARGS[@]} \
-+   ${CKPT_ARGS[@]} \
-+   ${ROLLOUT_ARGS[@]} \
-+   ${OPTIMIZER_ARGS[@]} \
-+   ${GRPO_ARGS[@]} \
+    -- python3 train.py \
+    --actor-num-nodes 1 \
+    --actor-num-gpus-per-node 8 \
+@@ -156,8 +207,10 @@ ray job submit --address="http://127.0.0.1:8265" \
+    ${ROLLOUT_ARGS[@]} \
+    ${OPTIMIZER_ARGS[@]} \
+    ${GRPO_ARGS[@]} \
 +   ${DISTRIBUTED_ARGS[@]} \
-+   ${WANDB_ARGS[@]} \
-+   ${PERF_ARGS[@]} \
-+   ${EVAL_ARGS[@]} \
-+   ${SGLANG_ARGS[@]} \
-+   ${MISC_ARGS[@]}
+    ${WANDB_ARGS[@]} \
+    ${PERF_ARGS[@]} \
+    ${EVAL_ARGS[@]} \
+    ${SGLANG_ARGS[@]} \
+    ${MISC_ARGS[@]}
 +# fi
 \ No newline at end of file
 diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
-index 7480f2d..acd9661 100644
+index ff53d90..eaf296a 100644
 --- a/slime/backends/megatron_utils/actor.py
 +++ b/slime/backends/megatron_utils/actor.py
-@@ -120,7 +120,11 @@ class MegatronTrainRayActor(TrainRayActor):
-             self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
+@@ -171,6 +171,8 @@ class MegatronTrainRayActor(TrainRayActor):
+             mpu.get_data_parallel_rank(with_context_parallel=False),
+             mpu.get_data_parallel_world_size(with_context_parallel=False),
+         )
++        if self.args.use_rollout_routing_replay:
++            rollout_data["rollout_routed_experts"] = RoutingReplay.prefetch_all_layers(rollout_data["tokens"])  
+         # TODO: this is ugly, move to somewhere else?
+         # move tokens to GPU in advance
+         rollout_data["tokens"] = [
+@@ -436,6 +438,7 @@ class MegatronTrainRayActor(TrainRayActor):
  
-         self.prof = TrainProfiler(args)
--
-+        if self.args.use_r3_cache:  
-+            from slime.utils.rollout_routing_replay import get_or_create_r3_cache  
-+            self.r3_cache = get_or_create_r3_cache(  
-+                cache_server_url=os.environ.get("R3_CACHE_SERVER_URL", "http://0.0.0.0:8000")  
-+            )  
-         return start_rollout_id
+     @timer
+     def update_weights(self) -> None:
++        RoutingReplay.clear_cache_server()
+         if self.args.debug_train_only or self.args.debug_rollout_only:
+             return
  
-     @torch.no_grad()
-@@ -254,6 +258,25 @@ class MegatronTrainRayActor(TrainRayActor):
-     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
-         # Create data iterator for log_probs and train.
-         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
-+        if self.args.use_r3_cache:  
-+            with timer("fetch data"):    
-+                from slime.backends.megatron_utils.data import get_batch    
-+                original_offset = data_iterator[0].offset    
-+                num_steps_per_rollout = len(num_microbatches)  
-+                for step_id in range(num_steps_per_rollout):  
-+                    for mb_id in range(num_microbatches[step_id]):  
-+                        batch = get_batch(data_iterator[0], ["tokens"])  
-+                        padded_tokens = batch["tokens"]  # [1, T_padded]  
-+                        success = self.r3_cache.prefetch_all_layers(  
-+                            padded_tokens.squeeze(0).tolist(),  # 转换为 1D list  
-+                            self.model[0].config,  
-+                        )  
-+                        if not success:  
-+                            print("⚠️ R3 Cache prefetch failed")  
-+                            break  
-+                    if not success:  
-+                        break  
-+                data_iterator[0].offset = original_offset
- 
-         with inverse_timer("train_wait"), timer("train"):
-             if self.args.compute_advantages_and_returns:
-@@ -301,7 +324,8 @@ class MegatronTrainRayActor(TrainRayActor):
-             log_rollout_data(rollout_id, self.args, rollout_data)
- 
-             # Train
--            if self.args.use_routing_replay:
-+            # if self.args.use_routing_replay:
-+            if True or self.args.use_r3:
-                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
-             with timer("actor_train"):
-                 train(
-@@ -317,6 +341,9 @@ class MegatronTrainRayActor(TrainRayActor):
- 
-         train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
- 
-+        from slime.utils.rollout_routing_replay import RolloutRoutingReplayCache  
-+        RolloutRoutingReplayCache.clear_all()          
-+
-         if self.args.use_routing_replay:
-             RoutingReplay.clear_all()
- 
-diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
-index afc6bef..4d3dec3 100644
---- a/slime/utils/arguments.py
-+++ b/slime/utils/arguments.py
-@@ -595,7 +595,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
-             parser.add_argument("--eval-min-new-tokens", type=int, default=None)
- 
-             return parser
--
-+        
-+        def add_r3_cache_arguments(parser):  
-+            """Add arguments for R3 (Rollout Routing Replay) Cache"""  
-+            parser.add_argument(  
-+                "--use-r3-cache",  
-+                action="store_true",  
-+                default=False,  
-+                help="Enable R3 (Rollout Routing Replay) cache for MoE routing decisions"  
-+            )  
-+            parser.add_argument(  
-+                "--r3-cache-server-url",  
-+                type=str,  
-+                default="http://0.0.0.0:8000",  
-+                help="URL of the R3 cache server for storing/retrieving routing decisions"  
-+            )  
-+            return parser
-         def add_algo_arguments(parser):
-             parser.add_argument(
-                 "--ref-load",
-@@ -1117,6 +1132,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
-         parser = add_rollout_buffer_arguments(parser)
-         parser = add_mtp_training_arguments(parser)
-         parser = add_ci_arguments(parser)
-+        parser = add_r3_cache_arguments(parser)
-         parser.set_defaults(sglang_tensor_parallel_size=add_sglang_tp_size())
- 
-         # For megatron
-@@ -1432,6 +1448,7 @@ def hf_validate_args(args, hf_config):
-         ("rope_theta", "rotary_base", equal),
-     ]:
-         if hasattr(hf_config, hf_config_name):
-+            return 
-             assert compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)), (
-                 f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
-                 f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
 diff --git a/slime/utils/data.py b/slime/utils/data.py
-index 2d35fc8..15a15b2 100644
+index 15f2cfb..6e81fe5 100644
 --- a/slime/utils/data.py
 +++ b/slime/utils/data.py
-@@ -104,7 +104,7 @@ class Dataset:
+@@ -107,7 +107,7 @@ class Dataset:
              self.origin_samples.append(
                  Sample(
                      prompt=prompt,
 -                    label=data[label_key] if label_key is not None else None,
-+                    label = data.get(label_key) if label_key is not None else None,
++                    label=data.get(label_key) if label_key is not None else None,
                      metadata=data.get(metadata_key) or {},
                  )
              )
-diff --git a/slime/utils/reloadable_process_group.py b/slime/utils/reloadable_process_group.py
-index 1583ed8..24ada70 100644
---- a/slime/utils/reloadable_process_group.py
-+++ b/slime/utils/reloadable_process_group.py
-@@ -124,6 +124,8 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
-     @staticmethod
-     def destroy_process_groups():
-         pid = os.getpid()
-+        if pid not in ReloadableProcessGroup.GROUPS:
-+            return
-         for reloadable_group in ReloadableProcessGroup.GROUPS[pid]:
-             if reloadable_group.group is None:
-                 continue
-@@ -135,6 +137,8 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
-     @staticmethod
-     def reload_process_groups():
-         pid = os.getpid()
-+        if pid not in ReloadableProcessGroup.GROUPS:  
-+            return                 
-         print(f"Reloading {len(ReloadableProcessGroup.GROUPS[pid])} process groups in pid {pid}", flush=True)
-         old_new_group = old_new_group_dict[pid]
-         for reloadable_group in ReloadableProcessGroup.GROUPS[pid]:
-diff --git a/slime/utils/rollout_routing_replay.py b/slime/utils/rollout_routing_replay.py
-new file mode 100644
-index 0000000..5676887
---- /dev/null
-+++ b/slime/utils/rollout_routing_replay.py
-@@ -0,0 +1,157 @@
-+import os  
-+import hashlib  
-+import requests  
-+import torch  
-+from typing import Optional, Tuple, List, Dict  
-+  
-+ROLLOUT_ROUTING_REPLAY_CACHE = None  
-+  
-+  
-+def set_r3_cache(cache):  
-+    global ROLLOUT_ROUTING_REPLAY_CACHE  
-+    ROLLOUT_ROUTING_REPLAY_CACHE = cache  
-+  
-+class RolloutRoutingReplayCache:  
-+    _instance = None  
-+      
-+    def __new__(cls, cache_server_url="http://0.0.0.0:8000"):  
-+        if cls._instance is None:  
-+            cls._instance = super().__new__(cls)  
-+            cls._instance._initialized = False  
-+        return cls._instance  
-+      
-+    def __init__(self, cache_server_url="http://0.0.0.0:8000"):  
-+        if self._initialized:  
-+            return  
-+        self.cache_server_url = cache_server_url  
-+        self.config = None  
-+          
-+        self.prefetched_data = {}  
-+        self.current_layer = None
-+        self.pop_count = 0
-+        self._initialized = True  
-+      
-+    def _compute_hash_key(self, token_ids: List[int], prior_hash: Optional[str] = None) -> str:  
-+        hasher = hashlib.sha256()  
-+        if prior_hash:  
-+            hasher.update(bytes.fromhex(prior_hash))  
-+          
-+        for t in token_ids:  
-+            hasher.update(int(t).to_bytes(4, byteorder="little", signed=False))  
-+          
-+        return hasher.hexdigest()  
-+      
-+    def prefetch_all_layers(self, token_ids: List[int], config) -> bool:  
-+        self.config = config  
-+        last_hash = None  
-+        hash_keys = []  
-+        for token_id in token_ids:  
-+            last_hash = self._compute_hash_key([token_id], prior_hash=last_hash)  
-+            hash_keys.append(last_hash)  
+diff --git a/slime/utils/routing_replay.py b/slime/utils/routing_replay.py
+index 8647281..9b5e0be 100644
+--- a/slime/utils/routing_replay.py
++++ b/slime/utils/routing_replay.py
+@@ -1,4 +1,10 @@
++import asyncio
++import hashlib
+ import os
++import time
++from typing import List, Optional
++import aiohttp
++import numpy as np
+ import torch
+ 
+ 
+@@ -53,10 +59,188 @@ class RoutingReplay:
+         for replay in RoutingReplay.all_routing_replays:
+             replay.clear_forward()
+ 
++    @staticmethod
++    def _compute_hash_key(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
++        hasher = hashlib.sha256()
++        if prior_hash:
++            hasher.update(bytes.fromhex(prior_hash))
++        for t in token_ids:
++            hasher.update(int(t).to_bytes(4, byteorder="little", signed=False))
++        return hasher.hexdigest()
++
++    @staticmethod
++    async def _wait_for_idle(cache_server_url: str) -> bool:
++        async with aiohttp.ClientSession() as session:
++            while True:
++                try:
++                    async with session.get(
++                        f"{cache_server_url}/idle_status",
++                        timeout=aiohttp.ClientTimeout(total=1)
++                    ) as response:
++                        if response.status == 200:
++                            result = await response.json()
++                            if result.get("is_idle", False):
++                                return True
++                except:
++                    pass
++                await asyncio.sleep(5)
++
++    @staticmethod
++    async def _fetch_all_batches_single_request(
++        hash_keys_list: List[List[str]], 
++        cache_server_url: str
++    ) -> List[tuple]:
++        async with aiohttp.ClientSession() as session:
++            try:
++                batch_sizes = [len(keys) for keys in hash_keys_list]
++                all_keys = [key for keys in hash_keys_list for key in keys]
++                
++                payload = {"keys": all_keys}
++                async with session.post(
++                    f"{cache_server_url}/batch_get",
++                    json=payload,
++                    timeout=aiohttp.ClientTimeout(total=1000)
++                ) as response:
++                    result = await response.json()
++                    all_data = result.get("data", [])
++                    
++                    retry_keys = []
++                    retry_indices = []
++                    for idx, data in enumerate(all_data):
++                        if data is None:
++                            retry_keys.append(all_keys[idx])
++                            retry_indices.append(idx)
++                    
++                    if retry_keys:
++                        print(f"🔄 Retrying {len(retry_keys)} failed keys...")
++                        retry_payload = {"keys": retry_keys}
++                        async with session.post(
++                            f"{cache_server_url}/batch_get",
++                            json=retry_payload,
++                            timeout=aiohttp.ClientTimeout(total=1000)
++                        ) as retry_response:
++                            retry_result = await retry_response.json()
++                            retry_data = retry_result.get("data", [])
++                            
++                            for retry_idx, original_idx in enumerate(retry_indices):
++                                if retry_idx < len(retry_data) and retry_data[retry_idx] is not None:
++                                    all_data[original_idx] = retry_data[retry_idx]
++                    
++                    results = []
++                    start_idx = 0
++                    for batch_size in batch_sizes:
++                        batch_data = all_data[start_idx:start_idx + batch_size]
++                        start_idx += batch_size
++                        
++                        processed_data = []
++                        hit_count = 0
++                        for data in batch_data:
++                            if data is not None:
++                                tensor = torch.tensor(data, dtype=torch.float32)
++                                array = tensor.cpu().numpy()
++                                half = array.shape[0] // 2
++                                expert_indices = array[:half].astype(np.int32).reshape(-1, 6)
++                                processed_data.append(expert_indices)
++                                hit_count += 1
++                            else:
++                                processed_data.append(None)
++                        
++                        results.append((processed_data, hit_count))
++                    
++                    return results
++                    
++            except Exception as e:
++                print(f"❌ Batch fetch failed: {e}")
++                return [([None] * len(keys), 0) for keys in hash_keys_list]
++
++    @staticmethod
++    def prefetch_all_layers(
++        token_ids_list: List[List[int]], 
++        cache_server_url: str = "http://0.0.0.0:8000"
++    ) -> List[Optional[np.ndarray]]:
++        total_start_time = time.time()
 +        
-+        try:  
-+            response = requests.post(  
-+                f"{self.cache_server_url}/batch_get",  
-+                json={"keys": hash_keys},  
-+                timeout=10  
-+            )  
++        hash_keys_list = []
++        hash_key_start = time.time()
++        for token_ids in token_ids_list:
++            hash_keys = []
++            last_hash = None
++            for token_id in token_ids:
++                last_hash = RoutingReplay._compute_hash_key([token_id], prior_hash=last_hash)
++                hash_keys.append(last_hash)
++            hash_keys_list.append(hash_keys)
++        hash_key_time = time.time() - hash_key_start
++        
++        try:
++            print("⏳ Waiting for server idle...")
++            idle_wait_start = time.time()
++            asyncio.run(RoutingReplay._wait_for_idle(cache_server_url))
++            idle_wait_time = time.time() - idle_wait_start
++            print(f"✅ Server idle after {idle_wait_time:.3f}s")
 +            
-+            data_list = response.json().get("data", [])  
-+            if not data_list:  
-+                return False  
++            fetch_start = time.time()
++            results = asyncio.run(
++                RoutingReplay._fetch_all_batches_single_request(hash_keys_list, cache_server_url)
++            )
++            fetch_time = time.time() - fetch_start
 +            
-+            num_layers = config.num_layers  
-+            topk = config.moe_router_topk  
++            result_arrays = []
++            total_hits = 0
++            total_keys = 0
++            process_start = time.time()
 +            
-+            template_data = next((data for data in data_list if data is not None), None)
-+            if template_data is None:
-+                return None, None      
-+            for layer_id in range(1, num_layers + 1):
-+                if layer_id not in self.prefetched_data:
-+                    from collections import deque
-+                    self.prefetched_data[layer_id] = deque()
-+                batch_ids = torch.zeros(  
-+                    (len(token_ids), topk),  
-+                    dtype=torch.int64,  
-+                    device="cpu",  
-+                    pin_memory=True  
-+                )  
-+                batch_weights = torch.zeros(  
-+                    (len(token_ids), topk),  
-+                    dtype=torch.float32,  
-+                    device="cpu",  
-+                    pin_memory=True  
-+                )  
-+                none_num = 0
-+                for i,  data in enumerate(data_list):  
-+                    if data is None or set(data) == {0}:
-+                        data = template_data
-+                        none_num = none_num + 1
-+                    ids_start = (layer_id - 1) * topk  
-+                    ids_end = ids_start + topk  
-+                    expert_ids = data[ids_start:ids_end]  
-+                    
-+                    weights_start = num_layers * topk + (layer_id - 1) * topk  
-+                    weights_end = weights_start + topk  
-+                    expert_weights = data[weights_start:weights_end]  
-+                    
-+                    batch_ids[i] = torch.tensor(expert_ids, dtype=torch.int64)  
-+                    batch_weights[i] = torch.tensor(expert_weights, dtype=torch.float32)  
-+                print(f"cache hit rate: {(len(data_list)-none_num)}/{len(data_list)} {(len(data_list)-none_num)/len(data_list)}")
-+                self.prefetched_data[layer_id].append((batch_weights, batch_ids))  
-+            return True  
++            for i, (cache_data, hit_count) in enumerate(results):
++                batch_size = len(hash_keys_list[i])
++                total_keys += batch_size
++                total_hits += hit_count
++                
++                if all(d is not None for d in cache_data):
++                    stacked = np.stack(cache_data, axis=0)
++                    result_arrays.append(stacked)
++                else:
++                    result_arrays.append(None)
++                    print(f"⚠️ Batch {i} partial hit: {hit_count}/{batch_size}")
 +            
-+        except Exception as e:  
-+            print(f"❌ R3 Cache prefetch failed: {e}")  
-+            import traceback  
-+            traceback.print_exc()  
-+            return False 
++            process_time = time.time() - process_start
++            total_time = time.time() - total_start_time
++            
++            print(f"⏱️ R3 Cache Prefetch Timing:")
++            print(f"   Hash Key Generation: {hash_key_time:.3f}s")
++            print(f"   Idle Wait: {idle_wait_time:.3f}s")
++            print(f"   Single HTTP Fetch: {fetch_time:.3f}s")
++            print(f"   Result Processing: {process_time:.3f}s")
++            print(f"   Total Time: {total_time:.3f}s")
++            
++            if total_keys > 0:
++                print(f"✅ R3 Cache prefetch completed. Total hits: {total_hits}/{total_keys}, "
++                    f"overall rate: {total_hits/total_keys:.2%}")
++            else:
++                print(f"✅ R3 Cache prefetch completed. No keys to fetch.")
++            
++            return result_arrays
++            
++        except Exception as e:
++            total_time = time.time() - total_start_time
++            print(f"❌ R3 Cache prefetch failed after {total_time:.3f}s: {e}")
++            import traceback
++            traceback.print_exc()
++            return [None] * len(token_ids_list)
 +
-+
-+    def pop_backward(self, layer_id):          
-+        self.pop_count = self.pop_count + 1
-+        batch_weights, batch_ids = self.prefetched_data[layer_id].popleft()  
-+        return (  
-+            batch_weights.to(torch.cuda.current_device()),  
-+            batch_ids.to(torch.cuda.current_device())  
-+        )  
-+      
-+    def clear_forward(self):  
-+        for layer_id in self.forward_indices:  
-+            self.forward_indices[layer_id] = 0  
-+      
-+    def clear(self):  
-+        self.prefetched_data.clear()  
-+      
-+    @staticmethod  
-+    def clear_all():  
-+        if ROLLOUT_ROUTING_REPLAY_CACHE is not None:  
-+            ROLLOUT_ROUTING_REPLAY_CACHE.clear()  
-+
-+def get_r3_cache_compute_topk(old_compute_topk):  
-+    def compute_topk(scores, topk, num_groups=None, group_topk=None):  
-+        if os.environ.get("ENABLE_R3_CACHE", "1") == "1":  
-+            r3_stage = os.environ.get("ROUTING_REPLAY_STAGE", "fallthrough")  
-+            layer_id = getattr(ROLLOUT_ROUTING_REPLAY_CACHE, 'current_layer', None) 
-+
-+            if r3_stage == "replay_backward":
-+                probs, top_indices = ROLLOUT_ROUTING_REPLAY_CACHE.pop_backward(layer_id)  
-+                return probs, top_indices  
-+        return old_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)  
-+    return compute_topk  
-+  
-+  
-+def get_or_create_r3_cache(cache_server_url="http://0.0.0.0:8000"):  
-+    global ROLLOUT_ROUTING_REPLAY_CACHE  
-+    if ROLLOUT_ROUTING_REPLAY_CACHE is None:  
-+        ROLLOUT_ROUTING_REPLAY_CACHE = RolloutRoutingReplayCache(cache_server_url)  
-+    return ROLLOUT_ROUTING_REPLAY_CACHE  
-+  
-+  
-+def register_r3_cache(module, cache_server_url="http://0.0.0.0:8000"):  
-+    if os.environ.get("ENABLE_R3_CACHE", "0") == "1":  
-+        module.r3_cache = get_or_create_r3_cache(cache_server_url)  
-+        def pre_forward_hook(module, input):  
-+            set_r3_cache(module.r3_cache)  
-+            module.r3_cache.current_layer = module.layer_number  
-+        module.register_forward_pre_hook(pre_forward_hook)
-\ No newline at end of file
++    @staticmethod
++    async def clear_cache_server(cache_server_url: str = "http://127.0.0.1:8000"):
++        async with aiohttp.ClientSession() as session:
++            try:
++                async with session.post(f"{cache_server_url}/clear_cache", timeout=5) as resp:
++                    if resp.status == 200:
++                        print("✅ Cache cleared on server.")
++                    else:
++                        print(f"❌ Failed to clear cache, status: {resp.status}")
++            except Exception as e:
++                print(f"❌ Exception when clearing cache: {e}")
+ 
+ def get_routing_replay_compute_topk(old_compute_topk):
+     def compute_topk(scores, topk, num_groups=None, group_topk=None):
+-        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
++        if os.environ.get("ENABLE_ROUTING_REPLAY", "1") == "1":
+             routing_replay_stage = os.environ["ROUTING_REPLAY_STAGE"]
+             if routing_replay_stage == "fallthrough":
+                 return old_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+@@ -83,7 +267,7 @@ def get_routing_replay_compute_topk(old_compute_topk):
+ 
+ 
+ def register_routing_replay(module):
+-    if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
++    if os.environ.get("ENABLE_ROUTING_REPLAY", "1") == "1":
+         module.routing_replay = RoutingReplay()
+ 
+         def pre_forward_hook(*args, **kwargs):
