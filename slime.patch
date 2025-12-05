@@ -1,226 +1,42 @@
-diff --git a/run.py b/run.py
-new file mode 100644
-index 0000000..1c4451e
---- /dev/null
-+++ b/run.py
-@@ -0,0 +1,192 @@
-+import asyncio, logging, multiprocessing, time
-+from typing import Any, Dict
-+from starlette.applications import Starlette
-+from starlette.responses import JSONResponse, Response
-+from starlette.routing import Route
-+import uvicorn
-+import orjson
-+
-+def loads(b: bytes) -> Any: return orjson.loads(b)
-+def dumps(obj: Any) -> bytes: return orjson.dumps(obj)
-+
-+logger = logging.getLogger("srv")
-+logging.basicConfig(level=logging.CRITICAL)
-+
-+_server_process = None
-+_server_started = False
-+
-+class IdleMonitor:
-+    def __init__(self, idle_timeout: float = 10.0):
-+        self.idle_timeout = idle_timeout
-+        self.last_request_time = time.time()
-+        self.is_idle = False
-+        self._task = None
-+        self._event = asyncio.Event()
-+        self._lock = asyncio.Lock()
-+
-+    def update_activity(self):
-+        self.last_request_time = time.time()
-+        if self.is_idle: self.is_idle = False
-+        self._event.set()
-+
-+    async def monitor_idle(self):
-+        while True:
-+            try:
-+                await asyncio.wait_for(self._event.wait(), timeout=self.idle_timeout)
-+                self._event.clear()
-+                if self.is_idle: self.is_idle = False
-+            except asyncio.TimeoutError:
-+                async with self._lock:
-+                    if time.time() - self.last_request_time >= self.idle_timeout:
-+                        if not self.is_idle: self.is_idle = True
-+
-+    def start_monitoring(self):
-+        if self._task is None:
-+            self._task = asyncio.create_task(self.monitor_idle())
-+
-+    def get_status(self):
-+        return {
-+            "is_idle": self.is_idle,
-+            "idle_duration": round(time.time() - self.last_request_time, 2),
-+            "idle_timeout": self.idle_timeout,
-+            "last_request_time": round(self.last_request_time, 3)
-+        }
-+
-+def _check_server_health(retries=3, delay=1.0) -> bool:
-+    import requests
-+    for _ in range(retries):
-+        try:
-+            if requests.get("http://127.0.0.1:8000/health", timeout=2).status_code == 200:
-+                return True
-+        except:
-+            time.sleep(delay)
-+    return False
-+
-+def _create_app(idle_timeout: float = 10.0) -> Starlette:
-+    app = Starlette()
-+    app.state.storage: Dict[str, Any] = {}
-+    app.state.storage_lock = asyncio.Lock()
-+    app.state.idle_monitor = IdleMonitor(idle_timeout)
-+
-+    async def startup():
-+        app.state.idle_monitor.start_monitoring()
-+    app.add_event_handler("startup", startup)
-+
-+    async def health(request):
-+        return JSONResponse({"status": "healthy"})
-+    app.add_route("/health", health, methods=["GET"])
-+
-+    async def idle_status(request):
-+        return JSONResponse(app.state.idle_monitor.get_status())
-+    app.add_route("/idle_status", idle_status, methods=["GET"])
-+
-+    async def batch_set(request):
-+        app.state.idle_monitor.update_activity()
-+        body = await request.body()
-+        if not body:
-+            return Response(content=dumps({"error": "empty"}), status_code=400, media_type="application/json")
-+        try:
-+            req = loads(body)
-+            keys = req.get("keys", [])
-+            data = req.get("data", [])
-+        except:
-+            return Response(content=dumps({"error": "invalid"}), status_code=400, media_type="application/json")
-+        n = min(len(keys), len(data))
-+        if n == 0: return {"results": []}
-+        async with app.state.storage_lock:
-+            for i in range(n): app.state.storage[keys[i]] = data[i]
-+        return JSONResponse({"results": [{"key": keys[i], "ok": True} for i in range(n)]})
-+
-+    async def batch_get(request):
-+        app.state.idle_monitor.update_activity()
-+        body = await request.body()
-+        if not body:
-+            return Response(content=dumps({"error": "empty"}), status_code=400, media_type="application/json")
-+        try:
-+            req = loads(body)
-+            keys = req.get("keys", [])
-+        except:
-+            return Response(content=dumps({"error": "invalid"}), status_code=400, media_type="application/json")
-+        storage = app.state.storage
-+        return JSONResponse({"data": [storage.get(k) for k in keys]})
-+
-+    async def batch_exists(request):
-+        app.state.idle_monitor.update_activity()
-+        body = await request.body()
-+        if not body:
-+            return Response(content=dumps({"error": "empty"}), status_code=400, media_type="application/json")
-+        try:
-+            req = loads(body)
-+            keys = req.get("keys", [])
-+        except:
-+            return Response(content=dumps({"error": "invalid"}), status_code=400, media_type="application/json")
-+        storage = app.state.storage
-+        c = 0
-+        for k in keys:
-+            if k in storage: c += 1
-+            else: break
-+        return JSONResponse({"consecutive_hits": c})
-+
-+    async def clear_cache(request):
-+        async with app.state.storage_lock:
-+            app.state.storage.clear()
-+        return JSONResponse({"status": "cleared"})
-+        
-+
-+    app.add_route("/batch_set", batch_set, methods=["POST"])
-+    app.add_route("/batch_get", batch_get, methods=["POST"])
-+    app.add_route("/batch_exists", batch_exists, methods=["POST"])
-+    app.add_route("/clear_cache", clear_cache, methods=["POST"])
-+    
-+    return app
-+
-+def run_server(host="0.0.0.0", port=8000, idle_timeout=10.0):
-+    try:
-+        import uvloop
-+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-+    except:
-+        pass
-+    app = _create_app(idle_timeout)
-+    config = uvicorn.Config(
-+        app,
-+        host=host,
-+        port=port,
-+        loop="asyncio",
-+        workers=1,
-+        lifespan="on",
-+        access_log=False,
-+        log_level="critical",
-+        backlog=1048576
-+    )
-+    uvicorn.Server(config).run()
-+
-+def _start_server():
-+    global _server_process, _server_started
-+    if not _server_started:
-+        _server_started = True
-+        _server_process = multiprocessing.Process(
-+            target=run_server,
-+            daemon=True,
-+            name="HiCache-HTTP-Server-Process",
-+            kwargs={"host": "127.0.0.1", "port": 8000, "idle_timeout": 10.0}
-+        )
-+        _server_process.start()
-+        for _ in range(10):
-+            time.sleep(0.5)
-+            if _check_server_health(retries=1, delay=0.1):
-+                break
-+        else:
-+            if _server_process.is_alive():
-+                _server_process.terminate()
-+                _server_process.join(5)
-+
-+def stop_server():
-+    global _server_process, _server_started
-+    if _server_process and _server_process.is_alive():
-+        _server_process.terminate()
-+        _server_process.join(10)
-+        if _server_process.is_alive(): _server_process.kill()
-+        _server_started = False
-+
-+if __name__ == "__main__":
-+    run_server()
 diff --git a/scripts/run-moonlight-16B-A3B.sh b/scripts/run-moonlight-16B-A3B.sh
 old mode 100644
 new mode 100755
-index fc5afd5..df99878
+index fc5afd5..07a2fd2
 --- a/scripts/run-moonlight-16B-A3B.sh
 +++ b/scripts/run-moonlight-16B-A3B.sh
-@@ -9,12 +9,15 @@ pkill -9 python
+@@ -6,15 +6,29 @@ sleep 3
+ ray stop --force
+ pkill -9 ray
+ pkill -9 python
++pkill -9 mooncake_master
  sleep 3
  pkill -9 ray
  pkill -9 python
 -pkill -9 redis
++pkill -9 mooncake_master
  
  set -ex
  
++# export MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8081/metadata"  
++export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"  
++export MOONCAKE_MASTER="127.0.0.1:50051"  
++export MOONCAKE_PROTOCOL="tcp"  
++export MOONCAKE_DEVICE=""  
++export MOONCAKE_GLOBAL_SEGMENT_SIZE="100 gb"
++export GLOG_v=3  # 更详细的日志级别
++
++
  # will prevent ray from buffering stdout/stderr
 -export PYTHONBUFFERED=16
 +export PYTHONBUFFERED=0
 +export CUDNN_LOGERR_DBG=1
 +
 +export LOG_FILE="./server_$(date +'%Y%m%d_%H%M%S').log"
-+python run.py > "$LOG_FILE" 2>&1 &
++mooncake_master --eviction_high_watermark_ratio=0.95  > "$LOG_FILE" 2>&1 &
  
  NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
  if [ "$NVLINK_COUNT" -gt 0 ]; then
-@@ -28,57 +31,60 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+@@ -28,57 +42,60 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
  source "${SCRIPT_DIR}/models/moonlight.sh"
  
  CKPT_ARGS=(
@@ -257,12 +73,12 @@ index fc5afd5..df99878
 +   --rm-type deepscaler
 +   --num-rollout 10
 +   --rollout-batch-size 1
-+   --n-samples-per-prompt 128
++   --n-samples-per-prompt 1
 +   --rollout-max-response-len 7800
     --rollout-temperature 0.8
 +   --use-rollout-routing-replay 
 +   # --use-slime-router
-+   --over-sampling-batch-size 128
++   --over-sampling-batch-size 1
 +   # --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
  
 -   --over-sampling-batch-size 256
@@ -318,7 +134,7 @@ index fc5afd5..df99878
  )
  
  GRPO_ARGS=(
-@@ -98,7 +104,6 @@ OPTIMIZER_ARGS=(
+@@ -98,7 +115,6 @@ OPTIMIZER_ARGS=(
     --weight-decay 0.1
     --adam-beta1 0.9
     --adam-beta2 0.98
@@ -326,7 +142,7 @@ index fc5afd5..df99878
     --optimizer-cpu-offload
     --overlap-cpu-optimizer-d2h-h2d
     --use-precision-aware-optimizer
-@@ -107,14 +112,39 @@ OPTIMIZER_ARGS=(
+@@ -107,14 +123,39 @@ OPTIMIZER_ARGS=(
  WANDB_ARGS=(
     # --use-wandb
     # --wandb-project slime-dev
@@ -335,14 +151,13 @@ index fc5afd5..df99878
     # --wandb-key ${WANDB_KEY}
 +   --use-tensorboard
 +   --tb-project-name R3   
-+   --tb-experiment-name noR3
++   --tb-experiment-name R3
  )
  
  SGLANG_ARGS=(
     --rollout-num-gpus-per-engine 8
--   --sglang-mem-fraction-static 0.7
+    --sglang-mem-fraction-static 0.7
 -   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
-+   --sglang-mem-fraction-static 0.8
 +
 +   # dp attention
 +   # --sglang-enable-dp-attention
@@ -365,11 +180,11 @@ index fc5afd5..df99878
 +   # --sglang-deepep-mode auto
 +
 +   # make every dp rank has 128 concurrency
-+   --sglang-server-concurrency 128
++   --sglang-server-concurrency 1024
  )
  
  MISC_ARGS=(
-@@ -125,28 +155,49 @@ MISC_ARGS=(
+@@ -125,28 +166,49 @@ MISC_ARGS=(
     --accumulate-allreduce-grads-in-fp32
     --attention-softmax-in-fp32
     # need to comment this when using model with MLA
@@ -435,7 +250,7 @@ index fc5afd5..df99878
     -- python3 train.py \
     --actor-num-nodes 1 \
     --actor-num-gpus-per-node 8 \
-@@ -156,8 +207,10 @@ ray job submit --address="http://127.0.0.1:8265" \
+@@ -156,8 +218,10 @@ ray job submit --address="http://127.0.0.1:8265" \
     ${ROLLOUT_ARGS[@]} \
     ${OPTIMIZER_ARGS[@]} \
     ${GRPO_ARGS[@]} \
@@ -448,23 +263,54 @@ index fc5afd5..df99878
 +# fi
 \ No newline at end of file
 diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
-index ff53d90..eaf296a 100644
+index ff53d90..6ce632f 100644
 --- a/slime/backends/megatron_utils/actor.py
 +++ b/slime/backends/megatron_utils/actor.py
-@@ -171,6 +171,8 @@ class MegatronTrainRayActor(TrainRayActor):
-             mpu.get_data_parallel_rank(with_context_parallel=False),
-             mpu.get_data_parallel_world_size(with_context_parallel=False),
-         )
-+        if self.args.use_rollout_routing_replay:
-+            rollout_data["rollout_routed_experts"] = RoutingReplay.prefetch_all_layers(rollout_data["tokens"])  
-         # TODO: this is ugly, move to somewhere else?
-         # move tokens to GPU in advance
+@@ -176,6 +176,10 @@ class MegatronTrainRayActor(TrainRayActor):
          rollout_data["tokens"] = [
-@@ -436,6 +438,7 @@ class MegatronTrainRayActor(TrainRayActor):
+             torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device()) for t in rollout_data["tokens"]
+         ]
++        # if self.args.use_rollout_routing_replay:
++        #     continue
++        rollout_data["rollout_routed_experts"] = RoutingReplay.prefetch_all_layers(rollout_data["tokens"])          
++            
+         rollout_data["loss_masks"] = [
+             torch.tensor(t, dtype=torch.int, device=torch.cuda.current_device()) for t in rollout_data["loss_masks"]
+         ]
+@@ -215,14 +219,8 @@ class MegatronTrainRayActor(TrainRayActor):
+ 
+         def pad_func(experts, pad):
+             _, num_layers, topk = experts.shape
+-            pad = (
+-                torch.arange(
+-                    pad * num_layers * topk,
+-                    device=experts.device,
+-                    dtype=experts.dtype,
+-                ).reshape((pad, num_layers, topk))
+-                % self.args.num_experts
+-            )
++            base_pattern = torch.arange(topk, device=rollout_routed_experts.device)
++            pad = base_pattern.reshape(1, 1, rollout_routed_experts.size(2)).expand(pad, num_layers, topk)
+             return torch.cat([experts, pad], dim=0)
+ 
+         for _ in range(sum(num_microbatches)):
+@@ -240,6 +238,11 @@ class MegatronTrainRayActor(TrainRayActor):
+             pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
+             if pad != 0:
+                 rollout_routed_experts = pad_func(rollout_routed_experts, pad)
++                L, S, E = rollout_routed_experts.shape   # L=layers, S=seq/tokens, E=experts/top-k
++                for i in range(L):
++                    for j in range(S):
++                        if torch.all(rollout_routed_experts[i, j] == 0):
++                            rollout_routed_experts[i, j] = torch.arange(E, device=rollout_routed_experts.device)
+ 
+             if self.args.sequence_parallel:
+                 seqlen = rollout_routed_experts.size(0)
+@@ -436,6 +439,7 @@ class MegatronTrainRayActor(TrainRayActor):
  
      @timer
      def update_weights(self) -> None:
-+        RoutingReplay.clear_cache_server()
++        RoutingReplay.clear_cache_server()        
          if self.args.debug_train_only or self.args.debug_rollout_only:
              return
  
@@ -482,26 +328,34 @@ index 15f2cfb..6e81fe5 100644
                  )
              )
 diff --git a/slime/utils/routing_replay.py b/slime/utils/routing_replay.py
-index 8647281..9b5e0be 100644
+index 8647281..0b926de 100644
 --- a/slime/utils/routing_replay.py
 +++ b/slime/utils/routing_replay.py
-@@ -1,4 +1,10 @@
+@@ -1,6 +1,13 @@
+ import os
+ import torch
+-
 +import asyncio
 +import hashlib
- import os
 +import time
 +from typing import List, Optional
 +import aiohttp
 +import numpy as np
- import torch
++from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore  
++from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig  
  
+ ROUTING_REPLAY = None
  
-@@ -53,10 +59,188 @@ class RoutingReplay:
+@@ -52,7 +59,180 @@ class RoutingReplay:
+     def clear_all_forward():
          for replay in RoutingReplay.all_routing_replays:
              replay.clear_forward()
- 
++    
 +    @staticmethod
-+    def _compute_hash_key(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
++    def _compute_hash_key(
++        token_ids: List[int], 
++        prior_hash: Optional[str] = None) -> str:
++        
 +        hasher = hashlib.sha256()
 +        if prior_hash:
 +            hasher.update(bytes.fromhex(prior_hash))
@@ -509,96 +363,69 @@ index 8647281..9b5e0be 100644
 +            hasher.update(int(t).to_bytes(4, byteorder="little", signed=False))
 +        return hasher.hexdigest()
 +
-+    @staticmethod
-+    async def _wait_for_idle(cache_server_url: str) -> bool:
-+        async with aiohttp.ClientSession() as session:
-+            while True:
-+                try:
-+                    async with session.get(
-+                        f"{cache_server_url}/idle_status",
-+                        timeout=aiohttp.ClientTimeout(total=1)
-+                    ) as response:
-+                        if response.status == 200:
-+                            result = await response.json()
-+                            if result.get("is_idle", False):
-+                                return True
-+                except:
-+                    pass
-+                await asyncio.sleep(5)
++    def _wait_for_idle(self,
++        cache_server_url: str) -> bool:
++        return
 +
 +    @staticmethod
-+    async def _fetch_all_batches_single_request(
++    def _fetch_all_batches_single_request(
 +        hash_keys_list: List[List[str]], 
-+        cache_server_url: str
-+    ) -> List[tuple]:
-+        async with aiohttp.ClientSession() as session:
-+            try:
-+                batch_sizes = [len(keys) for keys in hash_keys_list]
-+                all_keys = [key for keys in hash_keys_list for key in keys]
-+                
-+                payload = {"keys": all_keys}
-+                async with session.post(
-+                    f"{cache_server_url}/batch_get",
-+                    json=payload,
-+                    timeout=aiohttp.ClientTimeout(total=1000)
-+                ) as response:
-+                    result = await response.json()
-+                    all_data = result.get("data", [])
-+                    
-+                    retry_keys = []
-+                    retry_indices = []
-+                    for idx, data in enumerate(all_data):
-+                        if data is None:
-+                            retry_keys.append(all_keys[idx])
-+                            retry_indices.append(idx)
-+                    
-+                    if retry_keys:
-+                        print(f"🔄 Retrying {len(retry_keys)} failed keys...")
-+                        retry_payload = {"keys": retry_keys}
-+                        async with session.post(
-+                            f"{cache_server_url}/batch_get",
-+                            json=retry_payload,
-+                            timeout=aiohttp.ClientTimeout(total=1000)
-+                        ) as retry_response:
-+                            retry_result = await retry_response.json()
-+                            retry_data = retry_result.get("data", [])
-+                            
-+                            for retry_idx, original_idx in enumerate(retry_indices):
-+                                if retry_idx < len(retry_data) and retry_data[retry_idx] is not None:
-+                                    all_data[original_idx] = retry_data[retry_idx]
-+                    
-+                    results = []
-+                    start_idx = 0
-+                    for batch_size in batch_sizes:
-+                        batch_data = all_data[start_idx:start_idx + batch_size]
-+                        start_idx += batch_size
-+                        
-+                        processed_data = []
-+                        hit_count = 0
-+                        for data in batch_data:
-+                            if data is not None:
-+                                tensor = torch.tensor(data, dtype=torch.float32)
-+                                array = tensor.cpu().numpy()
-+                                half = array.shape[0] // 2
-+                                expert_indices = array[:half].astype(np.int32).reshape(-1, 6)
-+                                processed_data.append(expert_indices)
-+                                hit_count += 1
-+                            else:
-+                                processed_data.append(None)
-+                        
-+                        results.append((processed_data, hit_count))
-+                    
-+                    return results
-+                    
-+            except Exception as e:
-+                print(f"❌ Batch fetch failed: {e}")
-+                return [([None] * len(keys), 0) for keys in hash_keys_list]
++        store
++    ) -> tuple:
++        batch_sizes = [len(keys) for keys in hash_keys_list]
++        all_keys = [key for keys in hash_keys_list for key in keys]
++        total_keys = len(all_keys)
++        
++        print(f"🔍 Fetching {total_keys} keys from cache...")
++        
++        try:
++            result = store.batch_get(all_keys)
++            if result is None:
++                print(f"⚠️ batch_get returned None (all miss)")
++                return None, 0, total_keys
++            hits = 0
++            if isinstance(result, list):
++                for item in result:
++                    if item is not None:
++                        hits += 1
++            
++            print(f"✅ Cache hits: {hits}/{total_keys} ({hits/total_keys*100:.1f}%)")
++            
++            return result, hits, total_keys
++            
++        except Exception as e:
++            print(f"❌ batch_get error: {e}")
++            return None, 0, total_keys
 +
 +    @staticmethod
 +    def prefetch_all_layers(
-+        token_ids_list: List[List[int]], 
-+        cache_server_url: str = "http://0.0.0.0:8000"
++        token_ids_list: List[List[int]]
 +    ) -> List[Optional[np.ndarray]]:
++        store = MooncakeStore(
++            HiCacheStorageConfig(  
++                tp_size=1,  
++                tp_rank=0,  
++                is_mla_model=False,  
++                extra_config=None,
++                is_page_first_layout=True,
++                model_name=""
++            )  
++        )  
++        class MockHostKVCache:  
++            def __init__(self, buffer):  
++                self.kv_buffer = buffer  
++                self.layout = "page_first_direct"  
++                self.page_size = 1  
++                
++            def get_page_buffer_meta(self, indices):  
++                ptr_list = []  
++                element_size_list = []  
++                for idx in indices:  
++                    ptr_list.append(idx * 4)  
++                    element_size_list.append(4)  
++                return ptr_list, element_size_list          
++        store.register_mem_pool_host(MockHostKVCache(torch.zeros(1024 * 1024 , dtype=torch.float32)))
++        
 +        total_start_time = time.time()
 +        
 +        hash_keys_list = []
@@ -608,39 +435,52 @@ index 8647281..9b5e0be 100644
 +            last_hash = None
 +            for token_id in token_ids:
 +                last_hash = RoutingReplay._compute_hash_key([token_id], prior_hash=last_hash)
-+                hash_keys.append(last_hash)
++                hash_keys.append(last_hash+"_0_k")
 +            hash_keys_list.append(hash_keys)
++        
++        if hash_keys_list and hash_keys_list[0]:
++            print(f"📝 Sample keys (first 3): {hash_keys_list[0][:3]}")
++        
 +        hash_key_time = time.time() - hash_key_start
 +        
 +        try:
 +            print("⏳ Waiting for server idle...")
 +            idle_wait_start = time.time()
-+            asyncio.run(RoutingReplay._wait_for_idle(cache_server_url))
 +            idle_wait_time = time.time() - idle_wait_start
 +            print(f"✅ Server idle after {idle_wait_time:.3f}s")
 +            
 +            fetch_start = time.time()
-+            results = asyncio.run(
-+                RoutingReplay._fetch_all_batches_single_request(hash_keys_list, cache_server_url)
++            results, total_hits, total_keys = RoutingReplay._fetch_all_batches_single_request(
++                hash_keys_list, store
 +            )
 +            fetch_time = time.time() - fetch_start
 +            
 +            result_arrays = []
-+            total_hits = 0
-+            total_keys = 0
 +            process_start = time.time()
 +            
-+            for i, (cache_data, hit_count) in enumerate(results):
-+                batch_size = len(hash_keys_list[i])
-+                total_keys += batch_size
-+                total_hits += hit_count
-+                
-+                if all(d is not None for d in cache_data):
-+                    stacked = np.stack(cache_data, axis=0)
-+                    result_arrays.append(stacked)
-+                else:
-+                    result_arrays.append(None)
-+                    print(f"⚠️ Batch {i} partial hit: {hit_count}/{batch_size}")
++            if results is not None and isinstance(results, list):
++                key_offset = 0
++                for i, batch_keys in enumerate(hash_keys_list):
++                    batch_size = len(batch_keys)
++                    batch_results = results[key_offset:key_offset + batch_size]
++                    batch_hits = sum(1 for r in batch_results if r is not None)
++                    
++                    if batch_hits == batch_size:
++                        try:
++                            stacked = np.stack([r for r in batch_results], axis=0)
++                            result_arrays.append(stacked)
++                            print(f"✅ Batch {i}: {batch_hits}/{batch_size} hits (complete)")
++                        except Exception as e:
++                            result_arrays.append(None)
++                            print(f"⚠️ Batch {i}: stacking failed - {e}")
++                    else:
++                        result_arrays.append(None)
++                        print(f"⚠️ Batch {i}: {batch_hits}/{batch_size} hits (partial/miss)")
++                    
++                    key_offset += batch_size
++            else:
++                result_arrays = [None] * len(hash_keys_list)
++                print(f"❌ No valid results from cache")
 +            
 +            process_time = time.time() - process_start
 +            total_time = time.time() - total_start_time
@@ -648,15 +488,21 @@ index 8647281..9b5e0be 100644
 +            print(f"⏱️ R3 Cache Prefetch Timing:")
 +            print(f"   Hash Key Generation: {hash_key_time:.3f}s")
 +            print(f"   Idle Wait: {idle_wait_time:.3f}s")
-+            print(f"   Single HTTP Fetch: {fetch_time:.3f}s")
++            print(f"   Batch Get: {fetch_time:.3f}s")
 +            print(f"   Result Processing: {process_time:.3f}s")
 +            print(f"   Total Time: {total_time:.3f}s")
 +            
 +            if total_keys > 0:
-+                print(f"✅ R3 Cache prefetch completed. Total hits: {total_hits}/{total_keys}, "
-+                    f"overall rate: {total_hits/total_keys:.2%}")
++                hit_rate = total_hits / total_keys * 100
++                print(f"📊 Overall Cache Statistics:")
++                print(f"   Total Keys: {total_keys}")
++                print(f"   Cache Hits: {total_hits}")
++                print(f"   Hit Rate: {hit_rate:.2f}%")
++                
++                complete_batches = sum(1 for arr in result_arrays if arr is not None)
++                print(f"   Complete Batches: {complete_batches}/{len(hash_keys_list)}")
 +            else:
-+                print(f"✅ R3 Cache prefetch completed. No keys to fetch.")
++                print(f"⚠️ No keys to fetch")
 +            
 +            return result_arrays
 +            
@@ -666,7 +512,7 @@ index 8647281..9b5e0be 100644
 +            import traceback
 +            traceback.print_exc()
 +            return [None] * len(token_ids_list)
-+
+ 
 +    @staticmethod
 +    async def clear_cache_server(cache_server_url: str = "http://127.0.0.1:8000"):
 +        async with aiohttp.ClientSession() as session:
@@ -681,17 +527,120 @@ index 8647281..9b5e0be 100644
  
  def get_routing_replay_compute_topk(old_compute_topk):
      def compute_topk(scores, topk, num_groups=None, group_topk=None):
--        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
-+        if os.environ.get("ENABLE_ROUTING_REPLAY", "1") == "1":
-             routing_replay_stage = os.environ["ROUTING_REPLAY_STAGE"]
-             if routing_replay_stage == "fallthrough":
-                 return old_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
-@@ -83,7 +267,7 @@ def get_routing_replay_compute_topk(old_compute_topk):
- 
- 
- def register_routing_replay(module):
--    if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
-+    if os.environ.get("ENABLE_ROUTING_REPLAY", "1") == "1":
-         module.routing_replay = RoutingReplay()
- 
-         def pre_forward_hook(*args, **kwargs):
+diff --git a/test.py b/test.py
+new file mode 100644
+index 0000000..e81fb88
+--- /dev/null
++++ b/test.py
+@@ -0,0 +1,110 @@
++import os  
++import torch  
++from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore  
++from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig  
++  
++def query_mooncake_key_and_ranks():  
++    """查询特定key及其在不同rank下的存在情况"""  
++      
++    # 初始化Mooncake存储  
++    storage_config = HiCacheStorageConfig(  
++        tp_size=1,  
++        tp_rank=0,  
++        is_mla_model=False,  
++        extra_config=None,
++        is_page_first_layout=True,
++        model_name=""
++    )  
++      
++    store = MooncakeStore(storage_config)  
++      
++    # 创建模拟内存池（注册用）  
++    buffer_size = 1024 * 1024  # 1MB  
++    buffer = torch.zeros(buffer_size, dtype=torch.float32)  
++      
++    class MockHostKVCache:  
++        def __init__(self, buffer):  
++            self.kv_buffer = buffer  
++            self.layout = "page_first_direct"  
++            self.page_size = 1  
++              
++        def get_page_buffer_meta(self, indices):  
++            ptr_list = []  
++            element_size_list = []  
++            for idx in indices:  
++                ptr_list.append(idx * 4)  
++                element_size_list.append(4)  
++            return ptr_list, element_size_list  
++      
++    mock_host_kv_cache = MockHostKVCache(buffer)  
++    store.register_mem_pool_host(mock_host_kv_cache)  
++      
++    # 用户提供的key  
++    target_key = "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119_5_v"  
++      
++    # 解析基础hash和rank  
++    parts = target_key.split('_')  
++    base_hash = '_'.join(parts[:-2])  # 78e477474baa5fa636f1daaf3c7fc47a282107cec5058bd61490115c5eac08b2  
++    target_rank = parts[-2]           # 2  
++    kv_type = parts[-1]              # v  
++      
++    print(f"查询基础hash: {base_hash}")  
++    print(f"目标rank: {target_rank}, 类型: {kv_type}")  
++    print("=" * 80)  
++      
++    # 检查目标key是否存在  
++    target_exists = store.exists(target_key)  
++    print(f"目标key {target_key}: {'存在' if target_exists else '不存在'}")  
++      
++    # 查询其他rank版本 (假设rank范围0-7)  
++    print(f"\n查询基础hash {base_hash} 在其他rank下的存在情况:")  
++    existing_ranks = []  
++      
++    for rank in range(8):  # 假设最多8个rank  
++        k_key = f"{base_hash}_{rank}_k"  
++        v_key = f"{base_hash}_{rank}_v"  
++          
++        k_exists = store.exists(k_key)  
++        v_exists = store.exists(v_key)  
++          
++        if k_exists and v_exists:  
++            existing_ranks.append(rank)  
++            print(f"  Rank {rank}: K和V都存在 ✓")  
++        elif k_exists:  
++            print(f"  Rank {rank}: 仅K存在 ⚠️")  
++        elif v_exists:  
++            print(f"  Rank {rank}: 仅V存在 ⚠️")  
++
++        receive_buffer = torch.zeros(1000, dtype=torch.float32)  
++        receive_location = receive_buffer.data_ptr()  
++        receive_size = receive_buffer.numel() * receive_buffer.element_size()  
++            
++        # 获取数据  
++        success = store.get(v_key, receive_location, receive_size)  
++        if success:  
++            print(f"成功获取数据，大小: {receive_size} bytes")  
++            print(f"数据前10个值: {receive_buffer}")  
++        else:  
++            print("获取数据失败")             
++      
++    print(f"\n总结: 基础hash {base_hash} 在以下rank中存在完整KV数据: {existing_ranks}")  
++      
++
++  
++if __name__ == "__main__":  
++    # 确保设置了必要的环境变量  
++    required_env_vars = [  
++        "MOONCAKE_MASTER",  
++        "MOONCAKE_PROTOCOL",   
++        "MOONCAKE_GLOBAL_SEGMENT_SIZE"  
++    ]  
++      
++    missing_vars = [var for var in required_env_vars if not os.getenv(var)]  
++    if missing_vars:  
++        print(f"请设置以下环境变量: {', '.join(missing_vars)}")  
++        print("示例:")  
++        print("export MOONCAKE_MASTER='127.0.0.1:50051'")  
++        print("export MOONCAKE_PROTOCOL='rdma'")  
++        print("export MOONCAKE_GLOBAL_SEGMENT_SIZE='4gb'")  
++    else:  
++        query_mooncake_key_and_ranks()
+\ No newline at end of file

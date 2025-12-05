@@ -180,60 +180,6 @@ index 7d2c01b31..49f84005c 100755
      ${TRAINING_ARGS[@]} \
      ${MODEL_PARALLEL_ARGS[@]} \
      ${DATA_ARGS[@]} \
-diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gpt_model.py
-index 6ca48b55f..427c9a134 100644
---- a/megatron/core/models/gpt/gpt_model.py
-+++ b/megatron/core/models/gpt/gpt_model.py
-@@ -367,6 +367,8 @@ class GPTModel(LanguageModule):
-             runtime_gather_output (bool): Gather output at runtime. Default None means
-                 `parallel_output` arg in the constructor will be used.
-         """
-+        from megatron.core.moe.cache_context import MoECacheContext 
-+        MoECacheContext.set_input_ids(input_ids[0].tolist()) 
- 
-         inference_context = deprecate_inference_params(inference_context, inference_params)
- 
-diff --git a/megatron/core/moe/cache_context.py b/megatron/core/moe/cache_context.py
-new file mode 100644
-index 000000000..3300d6738
---- /dev/null
-+++ b/megatron/core/moe/cache_context.py
-@@ -0,0 +1,21 @@
-+import threading  
-+from typing import Optional, List  
-+  
-+class MoECacheContext:  
-+    """Thread-safe context for passing token IDs through forward pass"""  
-+    _thread_local = threading.local()  
-+      
-+    @classmethod  
-+    def set_input_ids(cls, input_ids: List[int]):  
-+        """Set token IDs for current forward pass"""  
-+        cls._thread_local.input_ids = input_ids  
-+      
-+    @classmethod  
-+    def get_input_ids(cls) -> Optional[List[int]]:  
-+        """Get token IDs for current forward pass"""  
-+        return getattr(cls._thread_local, 'input_ids', None)  
-+      
-+    @classmethod  
-+    def clear(cls):  
-+        """Clear context after forward pass"""  
-+        cls._thread_local.input_ids = None
-\ No newline at end of file
-diff --git a/megatron/training/checkpointing.py b/megatron/training/checkpointing.py
-index c15c05196..812dbf437 100644
---- a/megatron/training/checkpointing.py
-+++ b/megatron/training/checkpointing.py
-@@ -99,7 +99,7 @@ def check_checkpoint_args(checkpoint_args):
-         error_message = '{} value from checkpoint ({}) is not equal to the ' \
-                         'input argument value ({}).'.format(
-                             arg_name, checkpoint_value, args_value)
--        assert checkpoint_value == args_value, error_message
-+        # assert checkpoint_value == args_value, error_message
- 
-     _compare('num_layers')
-     _compare('hidden_size')
 diff --git a/megatron/training/tokenizer/tokenizer.py b/megatron/training/tokenizer/tokenizer.py
 index d1554ca4c..c5b455d85 100644
 --- a/megatron/training/tokenizer/tokenizer.py
@@ -247,15 +193,3 @@ index d1554ca4c..c5b455d85 100644
      elif args.tokenizer_type == 'Llama2Tokenizer':
          assert args.tokenizer_model is not None
          tokenizer = _Llama2Tokenizer(args.tokenizer_model)
-diff --git a/megatron/training/training.py b/megatron/training/training.py
-index 83626c6cb..b0abd92b0 100644
---- a/megatron/training/training.py
-+++ b/megatron/training/training.py
-@@ -2477,6 +2477,7 @@ def evaluate_and_print_results(
-     non_loss_data_func=None,
- ):
-     """Helper function to evaluate and dump results on screen."""
-+    return
-     args = get_args()
-     if write_to_tensorboard:
-         writer = get_tensorboard_writer()

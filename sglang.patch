@@ -274,7 +274,7 @@ index 9a43121..314f05f 100644
          self.enable_priority_scheduling = enable_priority_scheduling
          self.schedule_low_priority_values_first = schedule_low_priority_values_first
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index dd9f613..7573949 100644
+index dd9f613..7fadfa9 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -150,7 +150,7 @@ from sglang.srt.managers.session_controller import Session
@@ -310,20 +310,20 @@ index dd9f613..7573949 100644
 +        self.moe_tree_cache = MoEHiRadixCache(  
 +            req_to_token_pool=self.moe_req_to_token_pool,  
 +            token_to_kv_pool_allocator=self.moe_token_to_kv_pool_allocator,  
-+            tp_cache_group=(
-+                self.attn_tp_cpu_group
-+                if self.server_args.enable_dp_attention
-+                else self.tp_cpu_group
-+            ),
++            tp_cache_group=(  
++                self.attn_tp_cpu_group  
++                if self.server_args.enable_dp_attention  
++                else self.tp_cpu_group  
++            ),  
 +            page_size=self.page_size,  
 +            hicache_ratio=server_args.hicache_ratio,  
 +            hicache_size=server_args.hicache_size,  
 +            hicache_write_policy="write_through",  
 +            hicache_io_backend=server_args.hicache_io_backend,  
-+            hicache_mem_layout=server_args.hicache_mem_layout,  
++            hicache_mem_layout="page_first",  
 +            enable_metrics=self.enable_metrics,  
-+            hicache_storage_backend="http",  
-+        )  
++            hicache_storage_backend="mooncake",   
++        )
  
      def init_disaggregation(self):
          self.disaggregation_mode = DisaggregationMode(
@@ -640,168 +640,6 @@ index 312732e..62a649c 100644
 +            self.token_to_kv_pool_allocator.free(moe_indices[page_aligned_len:])  
 +
 +        self.req_to_token_pool.free(req.moe_req_pool_idx)  
-diff --git a/python/sglang/srt/mem_cache/storage/backend_factory.py b/python/sglang/srt/mem_cache/storage/backend_factory.py
-index 4b195c8..e2c2d27 100644
---- a/python/sglang/srt/mem_cache/storage/backend_factory.py
-+++ b/python/sglang/srt/mem_cache/storage/backend_factory.py
-@@ -183,6 +183,8 @@ class StorageBackendFactory:
-             return backend_class.from_env_config(bytes_per_page, dtype, storage_config)
-         elif backend_name == "eic":
-             return backend_class(storage_config, mem_pool_host)
-+        elif backend_name == "http":  
-+            return backend_class(storage_config)        
-         else:
-             raise ValueError(f"Unknown built-in backend: {backend_name}")
- 
-@@ -221,3 +223,9 @@ StorageBackendFactory.register_backend(
-     "sglang.srt.mem_cache.storage.eic.eic_storage",
-     "EICStorage",
- )
-+
-+StorageBackendFactory.register_backend(  
-+    "http",  
-+    "sglang.srt.mem_cache.storage.http_backend.storage_http",  
-+    "HiCacheHTTP"  
-+)
-\ No newline at end of file
-diff --git a/python/sglang/srt/mem_cache/storage/http_backend/storage_http.py b/python/sglang/srt/mem_cache/storage/http_backend/storage_http.py
-new file mode 100644
-index 0000000..e86b15f
---- /dev/null
-+++ b/python/sglang/srt/mem_cache/storage/http_backend/storage_http.py
-@@ -0,0 +1,132 @@
-+import asyncio
-+import logging
-+
-+import threading
-+import time
-+from typing import TYPE_CHECKING, Any
-+from pydantic import BaseModel  
-+from fastapi import FastAPI  
-+
-+import uvicorn
-+from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig, HiCacheStorageExtraInfo  
-+import requests  
-+import torch  
-+from typing import List, Optional  
-+  
-+logger = logging.getLogger(__name__)
-+
-+
-+
-+class HiCacheHTTP(HiCacheStorage):  
-+    def __init__(self, storage_config: HiCacheStorageConfig, server_url: str = "http://localhost:8000", timeout: int = 30):  
-+        self.server_url = server_url  
-+        self.timeout = timeout  
-+        self.tp_rank = storage_config.tp_rank  
-+        self.tp_size = storage_config.tp_size  
-+        self.is_mla_model = storage_config.is_mla_model    
-+
-+    def get(  
-+        self,  
-+        key: str,  
-+        target_location: Optional[Any] = None,  
-+        target_sizes: Optional[Any] = None,  
-+    ) -> torch.Tensor | None:  
-+        try:  
-+            response = requests.post(  
-+                f"{self.server_url}/get",  
-+                json={"key": key},  
-+                timeout=self.timeout  
-+            )  
-+            if response.status_code == 200:  
-+                data = response.json()["data"]  
-+                if data and target_location is not None:  
-+                    target_location.copy_(torch.tensor(data))  
-+                    return target_location  
-+            return None  
-+        except Exception as e:  
-+            logger.error(f"HTTP get failed: {e}")  
-+            return None  
-+      
-+    def batch_get(  
-+        self,  
-+        keys: List[str],  
-+        target_locations: Optional[Any] = None,  
-+        target_sizes: Optional[Any] = None,  
-+    ) -> List[torch.Tensor | None]:  
-+        try:  
-+            response = requests.post(  
-+                f"{self.server_url}/batch_get",  
-+                json={"keys": keys},  
-+                timeout=self.timeout  
-+            )  
-+            if response.status_code == 200:  
-+                data_list = response.json()["data"]  
-+                results = []  
-+                for i, data in enumerate(data_list):  
-+                    if data and target_locations and i < len(target_locations):  
-+                        target_locations[i].copy_(torch.tensor(data))  
-+                        results.append(target_locations[i])  
-+                    else:  
-+                        results.append(None)  
-+                return results  
-+            return [None] * len(keys)  
-+        except Exception as e:  
-+            logger.error(f"HTTP batch_get failed: {e}")  
-+            return [None] * len(keys)  
-+      
-+    def set(  
-+        self,  
-+        key: str,  
-+        value: Optional[Any] = None,  
-+        target_location: Optional[Any] = None,  
-+       target_sizes: Optional[Any] = None,  
-+    ) -> bool:  
-+        try:  
-+            if value is not None:  
-+                data = value.cpu().numpy().tolist()  
-+            else:  
-+                return False  
-+              
-+            response = requests.post(  
-+                f"{self.server_url}/set",  
-+                json={"key": key, "data": data},  
-+                timeout=self.timeout  
-+            )  
-+            return response.status_code == 200 and response.json().get("success", False)  
-+        except Exception as e:  
-+            logger.error(f"HTTP set failed: {e}")  
-+            return False  
-+      
-+    def batch_set(  
-+        self,  
-+        keys: List[str],  
-+        values: Optional[Any] = None,  
-+        target_locations: Optional[Any] = None,  
-+        target_sizes: Optional[Any] = None,  
-+    ) -> bool:  
-+        try:  
-+            if values is None:  
-+                return False  
-+              
-+            data_list = [v.float().cpu().numpy().tolist() for v in values]  
-+            response = requests.post(  
-+                f"{self.server_url}/batch_set",  
-+                json={"keys": keys, "data": data_list},  
-+                timeout=self.timeout  
-+            )  
-+            return response.status_code == 200 and all(response.json().get("results", []))  
-+        except Exception as e:  
-+            logger.error(f"HTTP batch_set failed: {e}")  
-+            return False  
-+      
-+    def exists(self, key: str) -> bool:  
-+        try:  
-+            response = requests.post(  
-+                f"{self.server_url}/exists",  
-+                json={"key": key},  
-+                timeout=self.timeout  
-+            )  
-+            return response.status_code == 200 and response.json().get("exists", False)  
-+        except Exception as e:  
-+            logger.error(f"HTTP exists failed: {e}")  
-+            return False
 diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
 index 58e95ba..541fe36 100644
 --- a/python/sglang/srt/model_executor/cuda_graph_runner.py
@@ -994,144 +832,3 @@ index 4209a3e..05725b6 100644
  
      def _forward_shared_experts(
          self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
-diff --git a/run.py b/run.py
-new file mode 100644
-index 0000000..2455048
---- /dev/null
-+++ b/run.py
-@@ -0,0 +1,134 @@
-+import asyncio
-+import logging
-+
-+import multiprocessing
-+import time
-+from pydantic import BaseModel  
-+from fastapi import FastAPI  
-+
-+import uvicorn
-+import requests  
-+from typing import List
-+  
-+logger = logging.getLogger(__name__)
-+_server_process = None
-+_server_started = False
-+
-+class BatchSetRequest(BaseModel):  
-+    keys: List[str]  
-+    data: List[List[float]]  
-+  
-+class BatchGetRequest(BaseModel):  
-+    keys: List[str]  
-+  
-+class BatchExistsRequest(BaseModel):  
-+    keys: List[str]  
-+
-+
-+def _check_server_health(retries=3, delay=1):
-+    for i in range(retries):
-+        try:
-+            response = requests.get("http://127.0.0.1:8000/health", timeout=5)
-+            if response.status_code == 200:
-+                return True
-+        except requests.exceptions.RequestException:
-+            if i < retries - 1:
-+                time.sleep(delay)
-+    return False
-+
-+def run_server():
-+
-+    try:
-+        loop = asyncio.new_event_loop()
-+        asyncio.set_event_loop(loop)
-+        
-+        app = FastAPI()
-+        storage = {}
-+        
-+        @app.post("/batch_set")
-+        async def batch_set(request : BatchSetRequest): 
-+            results = []
-+            for key, data in zip(request.keys, request.data):
-+                storage[key] = data
-+                print(data)
-+            return {"results": results}
-+        
-+        @app.post("/batch_get")
-+        async def batch_get(request: BatchGetRequest):  
-+            data = [storage.get(key) for key in request.keys]
-+            return {"data": data}
-+        
-+        @app.post("/batch_exists")
-+        async def batch_exists(request :BatchExistsRequest): 
-+            consecutive_hits = 0
-+            for key in request.keys:
-+                if key in storage:
-+                    consecutive_hits += 1
-+                else:
-+                    break
-+            return {"consecutive_hits": consecutive_hits}
-+        
-+        @app.get("/health")
-+        async def health_check():
-+            return {"status": "healthy"}
-+        
-+        config = uvicorn.Config(
-+            app,
-+            host="0.0.0.0",
-+            port=8000,
-+            loop="asyncio"
-+        )
-+        server = uvicorn.Server(config)
-+        loop.run_until_complete(server.serve())
-+    except Exception as e:
-+        logger.error(f"Failed to start HTTP server in process: {e}")
-+    finally:
-+        if loop is not None:
-+            loop.close()
-+
-+def _start_server():
-+    global _server_process, _server_started
-+    try:
-+        if not _server_started:
-+            _server_started = True
-+            _server_process = multiprocessing.Process(
-+                target=run_server,
-+                daemon=True,
-+                name="HiCache-HTTP-Server-Process"
-+            )
-+            
-+            _server_process.start()
-+            logger.info(f"Started HTTP server process with PID: {_server_process.pid}")
-+            
-+            for i in range(10):
-+                time.sleep(0.5)
-+                if _check_server_health(retries=1, delay=0.1):
-+                    _server_started = True
-+                    logger.info("HTTP server started successfully in separate process")
-+                    break
-+            else:
-+                logger.error("HTTP server process failed to start within timeout")
-+                if _server_process.is_alive():
-+                    _server_process.terminate()
-+                    _server_process.join(timeout=5)  
-+                
-+    except Exception as e:
-+        logger.error(f"Error starting HTTP server process: {e}")
-+        if _server_process and _server_process.is_alive():
-+            _server_process.terminate()
-+
-+def stop_server():
-+    global _server_process, _server_started
-+    if _server_process and _server_process.is_alive():
-+        logger.info("Stopping HTTP server process")
-+        _server_process.terminate()
-+        _server_process.join(timeout=10)   
-+        if _server_process.is_alive():
-+            logger.warning("Server process did not terminate gracefully, forcing kill")
-+            _server_process.kill()   
-+        _server_started = False
-+        logger.info("HTTP server process stopped")
-+
-+
-+if __name__ == "__main__":
-+    run_server()
-\ No newline at end of file
