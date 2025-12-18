@@ -1,103 +1,82 @@
-diff --git a/scripts/run-moonlight-16B-A3B.sh b/scripts/run-moonlight-16B-A3B.sh
-old mode 100644
-new mode 100755
-index fc5afd5..07a2fd2
---- a/scripts/run-moonlight-16B-A3B.sh
-+++ b/scripts/run-moonlight-16B-A3B.sh
-@@ -6,15 +6,29 @@ sleep 3
- ray stop --force
- pkill -9 ray
- pkill -9 python
-+pkill -9 mooncake_master
- sleep 3
- pkill -9 ray
- pkill -9 python
--pkill -9 redis
-+pkill -9 mooncake_master
- 
- set -ex
- 
-+# export MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8081/metadata"  
-+export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"  
-+export MOONCAKE_MASTER="127.0.0.1:50051"  
-+export MOONCAKE_PROTOCOL="tcp"  
-+export MOONCAKE_DEVICE=""  
-+export MOONCAKE_GLOBAL_SEGMENT_SIZE="100 gb"
-+export GLOG_v=3  # 更详细的日志级别
+diff --git a/scripts/run-moonlight.sh b/scripts/run-moonlight.sh
+new file mode 100755
+index 0000000..5743c05
+--- /dev/null
++++ b/scripts/run-moonlight.sh
+@@ -0,0 +1,221 @@
++#!/bin/bash
 +
++# for rerun the task
++pkill -9 sglang
++pkill -9 mooncake
++sleep 3
++ray stop --force
++pkill -9 ray
++pkill -9 python
++pkill -9 mooncake
++sleep 3
++pkill -9 ray
++pkill -9 python
++pkill -9 mooncake
 +
- # will prevent ray from buffering stdout/stderr
--export PYTHONBUFFERED=16
++set -ex
++
++# will prevent ray from buffering stdout/stderr
 +export PYTHONBUFFERED=0
 +export CUDNN_LOGERR_DBG=1
 +
-+export LOG_FILE="./server_$(date +'%Y%m%d_%H%M%S').log"
-+mooncake_master --eviction_high_watermark_ratio=0.95  > "$LOG_FILE" 2>&1 &
- 
- NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
- if [ "$NVLINK_COUNT" -gt 0 ]; then
-@@ -28,57 +42,60 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
- source "${SCRIPT_DIR}/models/moonlight.sh"
- 
- CKPT_ARGS=(
--   --hf-checkpoint /root/Moonlight-16B-A3B
--   --ref-load /root/Moonlight-16B-A3B_torch_dist
--   --load /root/Moonlight-16B-A3B_slime/
--   --save /root/Moonlight-16B-A3B_slime/
--   --save-interval 20
-+   --hf-checkpoint /gemini-0/platform/public/Moonlight-16B-A3B-Instruct
++export LOG_FILE="/afs/chatrl/users/wxe/slime/server_$(date +'%Y%m%d_%H%M%S').log"
++
++export MOONCAKE_MASTER="localhost:50051"
++export MOONCAKE_PROTOCOL="tcp"
++LOG_FILE="./mooncake_$(date +'%Y%m%d_%H%M%S').log" && mooncake_master &> "$LOG_FILE" &
++
++NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
++if [ "$NVLINK_COUNT" -gt 0 ]; then
++    HAS_NVLINK=1
++else
++    HAS_NVLINK=0
++fi
++echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
++
++SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
++source "${SCRIPT_DIR}/models/moonlight.sh"
++
++cp -r /afs/chatrl/users/wxe/slime_11_11/data /root/
++
++CKPT_ARGS=(
++   --hf-checkpoint /afs/chatrl/public/models/Moonlight-16B-A3B
 +   #--hf-checkpoint $BASE_DIR/DeepSeek-R1-bf16/
-+   --ref-load /gemini-0/platform/public/Moonlight-16B-A3B-Instruct-torch-dist
-+   --load /gemini-0/platform/public/Moonlight-16B-A3B-Instruct_torch_dist
++   --ref-load /afs/chatrl/public/models/Moonlight-16B-A3B_torch_dist
++   --load /afs/chatrl/public/models/Moonlight-16B-A3B_torch_dist
 +   # --save $BASE_DIR/DeepSeek-R1_slime/
 +   # --save-interval 20
- )
- 
- ROLLOUT_ARGS=(
--   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
-+   --prompt-data /gemini-0/platform/public/slime/data/DAPO-Math-17k.jsonl
-    --input-key prompt
--   --label-key label
-+   --label-key ground_truth
++)
++
++ROLLOUT_ARGS=(
++   --prompt-data /root/data/DAPO-Math-17k.jsonl
++   --input-key prompt
++   --label-key label
 +   # --tokenizer-type TikTokenizer
 +   # --tiktoken-pattern v2
 +   # --tokenizer-model /gemini/space/infra/wxe/Moonlight-16B-A3B/tokenizer_config.json
-    --apply-chat-template
--   --rollout-shuffle
--   --rm-type math
--   --num-rollout 3000
--   --rollout-batch-size 128
--   --n-samples-per-prompt 8
--   --rollout-max-response-len 4096
++   --apply-chat-template
 +   # --rollout-shuffle
 +   --rm-type deepscaler
-+   --num-rollout 10
++   --num-rollout 2
 +   --rollout-batch-size 1
 +   --n-samples-per-prompt 1
 +   --rollout-max-response-len 7800
-    --rollout-temperature 0.8
++   --rollout-temperature 0.8
 +   --use-rollout-routing-replay 
 +   # --use-slime-router
 +   --over-sampling-batch-size 1
 +   # --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
- 
--   --over-sampling-batch-size 256
--   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
--
--   --num-steps-per-rollout 4
--   # --global-batch-size 256
--   --balance-data   
++
 +   --num-steps-per-rollout 1
-+   --balance-data
- )
- 
--EVAL_ARGS=(
--   --eval-interval 20
--   --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
--   --n-samples-per-eval-prompt 8
--   --eval-max-response-len 4096
--   --eval-top-p 0.7
--)
++   # --balance-data
++)
++
 +# EVAL_ARGS=(
 +#    --eval-interval 20
 +#    --eval-prompt-data dapo /afs/chatrl/users/wxe/slime/data/DAPO-Math-17k.jsonl
@@ -105,66 +84,62 @@ index fc5afd5..07a2fd2
 +#    --eval-max-response-len 4096
 +#    --eval-top-p 0.7
 +# )
- 
- PERF_ARGS=(
--   --tensor-model-parallel-size 4
--   --sequence-parallel
--   --pipeline-model-parallel-size 1
++
++PERF_ARGS=(
 +   --tensor-model-parallel-size 1
 +   # --sequence-parallel
-+   --pipeline-model-parallel-size 8
-    --context-parallel-size 1
--   --expert-model-parallel-size 8
++   --pipeline-model-parallel-size 4
++   --context-parallel-size 1
 +   --expert-model-parallel-size 1
-    --expert-tensor-parallel-size 1
++   --expert-tensor-parallel-size 1
 +   --decoder-last-pipeline-num-layers 6
 +   # --recompute-granularity full
 +   # --recompute-method uniform
 +   # --recompute-num-layers 1
- 
--   --recompute-granularity full
--   --recompute-method uniform
--   --recompute-num-layers 1
--
--   # --micro-batch-size 1
--   --use-dynamic-batch-size
--   --max-tokens-per-gpu 8192
++
 +   # --use-dynamic-batch-size
 +   # --max-tokens-per-gpu 16384
- )
- 
- GRPO_ARGS=(
-@@ -98,7 +115,6 @@ OPTIMIZER_ARGS=(
-    --weight-decay 0.1
-    --adam-beta1 0.9
-    --adam-beta2 0.98
--
-    --optimizer-cpu-offload
-    --overlap-cpu-optimizer-d2h-h2d
-    --use-precision-aware-optimizer
-@@ -107,14 +123,39 @@ OPTIMIZER_ARGS=(
- WANDB_ARGS=(
-    # --use-wandb
-    # --wandb-project slime-dev
--   # --wandb-group moomlight-16B-A3B-test
++)
++
++GRPO_ARGS=(
++   --advantage-estimator grpo
++   --use-kl-loss
++   --kl-loss-coef 0.00
++   --kl-loss-type low_var_kl
++   --entropy-coef 0.00
++   --eps-clip 0.2
++   --eps-clip-high 0.28
++)
++
++OPTIMIZER_ARGS=(
++   --optimizer adam
++   --lr 1e-6
++   --lr-decay-style constant
++   --weight-decay 0.1
++   --adam-beta1 0.9
++   --adam-beta2 0.98
++   --optimizer-cpu-offload
++   --overlap-cpu-optimizer-d2h-h2d
++   --use-precision-aware-optimizer
++)
++
++WANDB_ARGS=(
++   # --use-wandb
++   # --wandb-project slime-dev
 +   # --wandb-group deepseek-r1-test
-    # --wandb-key ${WANDB_KEY}
-+   --use-tensorboard
-+   --tb-project-name R3   
-+   --tb-experiment-name R3
- )
- 
- SGLANG_ARGS=(
-    --rollout-num-gpus-per-engine 8
-    --sglang-mem-fraction-static 0.7
--   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
++   # --wandb-key ${WANDB_KEY}
++)
++
++SGLANG_ARGS=(
++   --rollout-num-gpus-per-engine 4
++   --sglang-mem-fraction-static 0.8
 +
 +   # dp attention
 +   # --sglang-enable-dp-attention
 +   # --sglang-enable-tokenizer-batch-encode 
 +   # --sglang-disable-cuda-graph
 +   --sglang-dp-size 1
-+   --sglang-tp-size 8
++   --sglang-tp-size 4
 +   --sglang-ep-size 1
 +   # --sglang-moe-dense-tp-size 1
 +   # --sglang-enable-dp-lm-head
@@ -180,41 +155,29 @@ index fc5afd5..07a2fd2
 +   # --sglang-deepep-mode auto
 +
 +   # make every dp rank has 128 concurrency
-+   --sglang-server-concurrency 1024
- )
- 
- MISC_ARGS=(
-@@ -125,28 +166,49 @@ MISC_ARGS=(
-    --accumulate-allreduce-grads-in-fp32
-    --attention-softmax-in-fp32
-    # need to comment this when using model with MLA
--   # --attention-backend flash
++   --sglang-server-concurrency 128
++)
++
++MISC_ARGS=(
++   # default dropout in megatron is 0.1
++   --attention-dropout 0.0
++   --hidden-dropout 0.0
++   # should be good for model performance
++   --accumulate-allreduce-grads-in-fp32
++   --attention-softmax-in-fp32
++   # need to comment this when using model with MLA
 +   --attention-backend flash
 +   # --debug-rollout-only
 +
- 
-    # use deepep for megatron
--   --moe-enable-deepep
--   --moe-token-dispatcher-type flex
++
++   # use deepep for megatron
 +   # --moe-enable-deepep
 +   # --moe-token-dispatcher-type flex
 +   # --use-routing-replay
 +   # --debug-rollout-only
- )
- 
- # launch the master node of ray in container
--export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
--ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
--
--# Build the runtime environment JSON with proper variable substitution
--RUNTIME_ENV_JSON="{
--  \"env_vars\": {
--    \"PYTHONPATH\": \"/root/Megatron-LM/\",
--    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
--    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
--  }
--}"
--
++)
++
++# launch the master node of ray in container
 +export no_proxy="127.0.0.1,${GEMINI_HOST_IP_taskrole1_0}"
 +ray start --head \
 +    --node-ip-address "127.0.0.1" \
@@ -233,8 +196,7 @@ index fc5afd5..07a2fd2
 +#     ray start --address "${GEMINI_HOST_IP_taskrole1_0}:6379" --num-gpus 8 --disable-usage-stats
 +# fi
 +# if [ "$GEMINI_CURRENT_TASK_ROLE_CURRENT_TASK_INDEX" -eq 0 ]; then
- ray job submit --address="http://127.0.0.1:8265" \
--   --runtime-env-json="${RUNTIME_ENV_JSON}" \
++ray job submit --address="http://127.0.0.1:8265" \
 +   --runtime-env-json='{
 +   "env_vars": {
 +      "no_proxy": "localhost,127.0.0.1,0.0.0.0",
@@ -247,73 +209,71 @@ index fc5afd5..07a2fd2
 +      "LD_LIBRARY_PATH": "/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/sgl-workspace/nvshmem/install/lib/"
 +   }
 +   }' \
-    -- python3 train.py \
-    --actor-num-nodes 1 \
-    --actor-num-gpus-per-node 8 \
-@@ -156,8 +218,10 @@ ray job submit --address="http://127.0.0.1:8265" \
-    ${ROLLOUT_ARGS[@]} \
-    ${OPTIMIZER_ARGS[@]} \
-    ${GRPO_ARGS[@]} \
++   -- python3 train.py \
++   --actor-num-nodes 1 \
++   --actor-num-gpus-per-node 4 \
++   --colocate \
++   ${MODEL_ARGS[@]} \
++   ${CKPT_ARGS[@]} \
++   ${ROLLOUT_ARGS[@]} \
++   ${OPTIMIZER_ARGS[@]} \
++   ${GRPO_ARGS[@]} \
 +   ${DISTRIBUTED_ARGS[@]} \
-    ${WANDB_ARGS[@]} \
-    ${PERF_ARGS[@]} \
-    ${EVAL_ARGS[@]} \
-    ${SGLANG_ARGS[@]} \
-    ${MISC_ARGS[@]}
++   ${WANDB_ARGS[@]} \
++   ${PERF_ARGS[@]} \
++   ${EVAL_ARGS[@]} \
++   ${SGLANG_ARGS[@]} \
++   ${MISC_ARGS[@]}
 +# fi
 \ No newline at end of file
 diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
-index ff53d90..6ce632f 100644
+index 3e9d2ea..2e9ecde 100644
 --- a/slime/backends/megatron_utils/actor.py
 +++ b/slime/backends/megatron_utils/actor.py
-@@ -176,6 +176,10 @@ class MegatronTrainRayActor(TrainRayActor):
+@@ -162,6 +162,7 @@ class MegatronTrainRayActor(TrainRayActor):
+             mpu.get_data_parallel_rank(with_context_parallel=False),
+             mpu.get_data_parallel_world_size(with_context_parallel=False),
+         )
++        rollout_data["rollout_routed_experts"] = RoutingReplay.prefetch_all_layers(rollout_data["tokens"])  
+         # TODO: this is ugly, move to somewhere else?
+         # move tokens to GPU in advance
          rollout_data["tokens"] = [
-             torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device()) for t in rollout_data["tokens"]
-         ]
-+        # if self.args.use_rollout_routing_replay:
-+        #     continue
-+        rollout_data["rollout_routed_experts"] = RoutingReplay.prefetch_all_layers(rollout_data["tokens"])          
-+            
-         rollout_data["loss_masks"] = [
-             torch.tensor(t, dtype=torch.int, device=torch.cuda.current_device()) for t in rollout_data["loss_masks"]
-         ]
-@@ -215,14 +219,8 @@ class MegatronTrainRayActor(TrainRayActor):
- 
-         def pad_func(experts, pad):
-             _, num_layers, topk = experts.shape
--            pad = (
--                torch.arange(
--                    pad * num_layers * topk,
--                    device=experts.device,
--                    dtype=experts.dtype,
--                ).reshape((pad, num_layers, topk))
--                % self.args.num_experts
--            )
-+            base_pattern = torch.arange(topk, device=rollout_routed_experts.device)
-+            pad = base_pattern.reshape(1, 1, rollout_routed_experts.size(2)).expand(pad, num_layers, topk)
-             return torch.cat([experts, pad], dim=0)
- 
-         for _ in range(sum(num_microbatches)):
-@@ -240,6 +238,11 @@ class MegatronTrainRayActor(TrainRayActor):
-             pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
+@@ -217,7 +218,12 @@ class MegatronTrainRayActor(TrainRayActor):
+             rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
+             pad = (128 - rollout_routed_experts.size(0) % 128) % 128
              if pad != 0:
-                 rollout_routed_experts = pad_func(rollout_routed_experts, pad)
-+                L, S, E = rollout_routed_experts.shape   # L=layers, S=seq/tokens, E=experts/top-k
-+                for i in range(L):
-+                    for j in range(S):
-+                        if torch.all(rollout_routed_experts[i, j] == 0):
-+                            rollout_routed_experts[i, j] = torch.arange(E, device=rollout_routed_experts.device)
+-                rollout_routed_experts = F.pad(rollout_routed_experts, (0, 0, 0, 0, 0, pad), value=0)
++                num_layers = rollout_routed_experts.size(1)
++                topk = rollout_routed_experts.size(2)
++
++                base_pattern = torch.arange(topk, device=rollout_routed_experts.device)
++                padding_tensor = base_pattern.reshape(1, 1, topk).expand(pad, num_layers, topk)
++                rollout_routed_experts = torch.cat([rollout_routed_experts, padding_tensor], dim=0)
  
              if self.args.sequence_parallel:
                  seqlen = rollout_routed_experts.size(0)
-@@ -436,6 +439,7 @@ class MegatronTrainRayActor(TrainRayActor):
+@@ -231,6 +237,8 @@ class MegatronTrainRayActor(TrainRayActor):
+                 num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
+                 offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+                 for layer_id in range(offset, offset + num_layers_to_build):
++                    if getattr(config, "moe_layer_freq", None) is not None and config.moe_layer_freq[layer_id] == 0:
++                        continue
+                     layer_routed_experts = rollout_routed_experts[:, layer_id]
+                     RoutingReplay.all_routing_replays[routing_replay_offset].record(layer_routed_experts)
+                     routing_replay_offset += 1
+diff --git a/slime/router/router.py b/slime/router/router.py
+index 90e234e..d584dbe 100644
+--- a/slime/router/router.py
++++ b/slime/router/router.py
+@@ -75,7 +75,7 @@ class SlimeRouter:
+         headers = dict(request.headers)
  
-     @timer
-     def update_weights(self) -> None:
-+        RoutingReplay.clear_cache_server()        
-         if self.args.debug_train_only or self.args.debug_rollout_only:
-             return
- 
+         try:
+-            response = await self.client.request(request.method, url, content=body, headers=headers)
++            response = await self.client.request(request.method, url, content=body, headers=headers, timeout=300.0)
+             # Eagerly read content so we can return JSON (not streaming)
+             content = await response.aread()
+             content_type = response.headers.get("content-type", "")
 diff --git a/slime/utils/data.py b/slime/utils/data.py
 index 15f2cfb..6e81fe5 100644
 --- a/slime/utils/data.py
@@ -328,319 +288,131 @@ index 15f2cfb..6e81fe5 100644
                  )
              )
 diff --git a/slime/utils/routing_replay.py b/slime/utils/routing_replay.py
-index 8647281..0b926de 100644
+index 8647281..a93ba71 100644
 --- a/slime/utils/routing_replay.py
 +++ b/slime/utils/routing_replay.py
-@@ -1,6 +1,13 @@
+@@ -1,6 +1,12 @@
  import os
  import torch
 -
-+import asyncio
-+import hashlib
 +import time
 +from typing import List, Optional
-+import aiohttp
 +import numpy as np
 +from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore  
 +from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig  
++from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
++from sglang.srt.mem_cache.hicache_storage import get_hash_str
  
  ROUTING_REPLAY = None
  
-@@ -52,7 +59,180 @@ class RoutingReplay:
-     def clear_all_forward():
-         for replay in RoutingReplay.all_routing_replays:
+@@ -10,6 +16,14 @@ def set_routing_replay(replay):
+     ROUTING_REPLAY = replay
+ 
+ 
++def get_data_as_tensor_list(host_kv_cache, host_indices):  
++    tensor_list = []  
++    for i, host_index in enumerate(host_indices):  
++        data_page = host_kv_cache.get_data_page(host_index, flat=True)  
++        tensor_list.append(data_page)  
++      
++    return tensor_list 
++
+ class RoutingReplay:
+     all_routing_replays = []
+ 
+@@ -54,9 +68,85 @@ class RoutingReplay:
              replay.clear_forward()
-+    
-+    @staticmethod
-+    def _compute_hash_key(
-+        token_ids: List[int], 
-+        prior_hash: Optional[str] = None) -> str:
-+        
-+        hasher = hashlib.sha256()
-+        if prior_hash:
-+            hasher.update(bytes.fromhex(prior_hash))
-+        for t in token_ids:
-+            hasher.update(int(t).to_bytes(4, byteorder="little", signed=False))
-+        return hasher.hexdigest()
+ 
+ 
++    @staticmethod  
++    def prefetch_all_layers(  
++        token_ids_list: List[List[int]]  
++    ) -> List[Optional[np.ndarray]]:  
++        os.environ["MOONCAKE_MASTER"] = "localhost:50051"
++        os.environ["MOONCAKE_PROTOCOL"] = "tcp"
++        store = MooncakeStore(  
++            HiCacheStorageConfig(    
++                tp_size=1,    
++                tp_rank=0,    
++                is_mla_model=False,
++                extra_config=None,  
++                is_page_first_layout=True,  
++                model_name=""  
++            )    
++        )    
++        class LightweightMHAPool:              
++            def __init__(self):  
++                self.head_num = 1 
++                self.head_dim = 12
++                self.layer_num = 27  
++                self.size = 2048  
++                self.store_dtype = torch.float32
++                self.device = "cpu"  
++                self.start_layer = 0  
++                self.end_layer = 26            
 +
-+    def _wait_for_idle(self,
-+        cache_server_url: str) -> bool:
-+        return
-+
-+    @staticmethod
-+    def _fetch_all_batches_single_request(
-+        hash_keys_list: List[List[str]], 
-+        store
-+    ) -> tuple:
-+        batch_sizes = [len(keys) for keys in hash_keys_list]
-+        all_keys = [key for keys in hash_keys_list for key in keys]
-+        total_keys = len(all_keys)
-+        
-+        print(f"🔍 Fetching {total_keys} keys from cache...")
-+        
-+        try:
-+            result = store.batch_get(all_keys)
-+            if result is None:
-+                print(f"⚠️ batch_get returned None (all miss)")
-+                return None, 0, total_keys
-+            hits = 0
-+            if isinstance(result, list):
-+                for item in result:
-+                    if item is not None:
-+                        hits += 1
-+            
-+            print(f"✅ Cache hits: {hits}/{total_keys} ({hits/total_keys*100:.1f}%)")
-+            
-+            return result, hits, total_keys
-+            
-+        except Exception as e:
-+            print(f"❌ batch_get error: {e}")
-+            return None, 0, total_keys
-+
-+    @staticmethod
-+    def prefetch_all_layers(
-+        token_ids_list: List[List[int]]
-+    ) -> List[Optional[np.ndarray]]:
-+        store = MooncakeStore(
-+            HiCacheStorageConfig(  
-+                tp_size=1,  
-+                tp_rank=0,  
-+                is_mla_model=False,  
-+                extra_config=None,
-+                is_page_first_layout=True,
-+                model_name=""
-+            )  
++        host_kv_cache = MHATokenToKVPoolHost(  
++            device_pool=LightweightMHAPool(),
++            host_to_device_ratio=2.0,  
++            host_size=0,  
++            page_size=1,  
++            layout="page_first_direct",  
++            pin_memory=True,  
++            device="cpu"  
 +        )  
-+        class MockHostKVCache:  
-+            def __init__(self, buffer):  
-+                self.kv_buffer = buffer  
-+                self.layout = "page_first_direct"  
-+                self.page_size = 1  
-+                
-+            def get_page_buffer_meta(self, indices):  
-+                ptr_list = []  
-+                element_size_list = []  
-+                for idx in indices:  
-+                    ptr_list.append(idx * 4)  
-+                    element_size_list.append(4)  
-+                return ptr_list, element_size_list          
-+        store.register_mem_pool_host(MockHostKVCache(torch.zeros(1024 * 1024 , dtype=torch.float32)))
 +        
-+        total_start_time = time.time()
++        store.register_mem_pool_host(host_kv_cache)  
++      
++        hash_keys_list = []  
++        hash_key_start = time.time()  
++        for token_ids in token_ids_list:  
++            hash_keys = []  
++            last_hash = None  
++            for token_id in token_ids:  
++                last_hash = get_hash_str([token_id], prior_hash=last_hash)  
++                hash_keys.append(last_hash)  
++            hash_keys_list.append(hash_keys)  
++        hash_key_time = time.time() - hash_key_start  
++          
++        all_keys = [key for keys in hash_keys_list for key in keys]  
++        host_indices = torch.arange(len(all_keys))  
++
++        print(f"🔍 Fetching {len(all_keys)} keys from cache...")  
++        results = store.batch_get_v1(all_keys, host_indices)  
 +        
-+        hash_keys_list = []
-+        hash_key_start = time.time()
-+        for token_ids in token_ids_list:
-+            hash_keys = []
-+            last_hash = None
-+            for token_id in token_ids:
-+                last_hash = RoutingReplay._compute_hash_key([token_id], prior_hash=last_hash)
-+                hash_keys.append(last_hash+"_0_k")
-+            hash_keys_list.append(hash_keys)
++        hits = sum(1 for r in results if r)  
++        print(f"✅ Cache hits: {hits}/{len(all_keys)}")  
 +        
-+        if hash_keys_list and hash_keys_list[0]:
-+            print(f"📝 Sample keys (first 3): {hash_keys_list[0][:3]}")
-+        
-+        hash_key_time = time.time() - hash_key_start
-+        
-+        try:
-+            print("⏳ Waiting for server idle...")
-+            idle_wait_start = time.time()
-+            idle_wait_time = time.time() - idle_wait_start
-+            print(f"✅ Server idle after {idle_wait_time:.3f}s")
++        result_arrays = []  
++        key_offset = 0  
++
++        for _, batch_keys in enumerate(hash_keys_list):  
++            batch_size = len(batch_keys)  
++            batch_results = results[key_offset:key_offset + batch_size]  
 +            
-+            fetch_start = time.time()
-+            results, total_hits, total_keys = RoutingReplay._fetch_all_batches_single_request(
-+                hash_keys_list, store
-+            )
-+            fetch_time = time.time() - fetch_start
++            if all(r for r in batch_results):  
++                batch_host_indices = host_indices[key_offset:key_offset + batch_size]  
++                tensor_list = get_data_as_tensor_list(host_kv_cache, batch_host_indices)  
++                result_arrays.append(tensor_list)  
++            else:  
++                result_arrays.append(None)  
 +            
-+            result_arrays = []
-+            process_start = time.time()
-+            
-+            if results is not None and isinstance(results, list):
-+                key_offset = 0
-+                for i, batch_keys in enumerate(hash_keys_list):
-+                    batch_size = len(batch_keys)
-+                    batch_results = results[key_offset:key_offset + batch_size]
-+                    batch_hits = sum(1 for r in batch_results if r is not None)
-+                    
-+                    if batch_hits == batch_size:
-+                        try:
-+                            stacked = np.stack([r for r in batch_results], axis=0)
-+                            result_arrays.append(stacked)
-+                            print(f"✅ Batch {i}: {batch_hits}/{batch_size} hits (complete)")
-+                        except Exception as e:
-+                            result_arrays.append(None)
-+                            print(f"⚠️ Batch {i}: stacking failed - {e}")
-+                    else:
-+                        result_arrays.append(None)
-+                        print(f"⚠️ Batch {i}: {batch_hits}/{batch_size} hits (partial/miss)")
-+                    
-+                    key_offset += batch_size
-+            else:
-+                result_arrays = [None] * len(hash_keys_list)
-+                print(f"❌ No valid results from cache")
-+            
-+            process_time = time.time() - process_start
-+            total_time = time.time() - total_start_time
-+            
-+            print(f"⏱️ R3 Cache Prefetch Timing:")
-+            print(f"   Hash Key Generation: {hash_key_time:.3f}s")
-+            print(f"   Idle Wait: {idle_wait_time:.3f}s")
-+            print(f"   Batch Get: {fetch_time:.3f}s")
-+            print(f"   Result Processing: {process_time:.3f}s")
-+            print(f"   Total Time: {total_time:.3f}s")
-+            
-+            if total_keys > 0:
-+                hit_rate = total_hits / total_keys * 100
-+                print(f"📊 Overall Cache Statistics:")
-+                print(f"   Total Keys: {total_keys}")
-+                print(f"   Cache Hits: {total_hits}")
-+                print(f"   Hit Rate: {hit_rate:.2f}%")
-+                
-+                complete_batches = sum(1 for arr in result_arrays if arr is not None)
-+                print(f"   Complete Batches: {complete_batches}/{len(hash_keys_list)}")
-+            else:
-+                print(f"⚠️ No keys to fetch")
-+            
-+            return result_arrays
-+            
-+        except Exception as e:
-+            total_time = time.time() - total_start_time
-+            print(f"❌ R3 Cache prefetch failed after {total_time:.3f}s: {e}")
-+            import traceback
-+            traceback.print_exc()
-+            return [None] * len(token_ids_list)
- 
-+    @staticmethod
-+    async def clear_cache_server(cache_server_url: str = "http://127.0.0.1:8000"):
-+        async with aiohttp.ClientSession() as session:
-+            try:
-+                async with session.post(f"{cache_server_url}/clear_cache", timeout=5) as resp:
-+                    if resp.status == 200:
-+                        print("✅ Cache cleared on server.")
-+                    else:
-+                        print(f"❌ Failed to clear cache, status: {resp.status}")
-+            except Exception as e:
-+                print(f"❌ Exception when clearing cache: {e}")
- 
++            key_offset += batch_size 
++        return result_arrays  
++
  def get_routing_replay_compute_topk(old_compute_topk):
      def compute_topk(scores, topk, num_groups=None, group_topk=None):
-diff --git a/test.py b/test.py
-new file mode 100644
-index 0000000..e81fb88
---- /dev/null
-+++ b/test.py
-@@ -0,0 +1,110 @@
-+import os  
-+import torch  
-+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore  
-+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig  
-+  
-+def query_mooncake_key_and_ranks():  
-+    """查询特定key及其在不同rank下的存在情况"""  
-+      
-+    # 初始化Mooncake存储  
-+    storage_config = HiCacheStorageConfig(  
-+        tp_size=1,  
-+        tp_rank=0,  
-+        is_mla_model=False,  
-+        extra_config=None,
-+        is_page_first_layout=True,
-+        model_name=""
-+    )  
-+      
-+    store = MooncakeStore(storage_config)  
-+      
-+    # 创建模拟内存池（注册用）  
-+    buffer_size = 1024 * 1024  # 1MB  
-+    buffer = torch.zeros(buffer_size, dtype=torch.float32)  
-+      
-+    class MockHostKVCache:  
-+        def __init__(self, buffer):  
-+            self.kv_buffer = buffer  
-+            self.layout = "page_first_direct"  
-+            self.page_size = 1  
-+              
-+        def get_page_buffer_meta(self, indices):  
-+            ptr_list = []  
-+            element_size_list = []  
-+            for idx in indices:  
-+                ptr_list.append(idx * 4)  
-+                element_size_list.append(4)  
-+            return ptr_list, element_size_list  
-+      
-+    mock_host_kv_cache = MockHostKVCache(buffer)  
-+    store.register_mem_pool_host(mock_host_kv_cache)  
-+      
-+    # 用户提供的key  
-+    target_key = "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119_5_v"  
-+      
-+    # 解析基础hash和rank  
-+    parts = target_key.split('_')  
-+    base_hash = '_'.join(parts[:-2])  # 78e477474baa5fa636f1daaf3c7fc47a282107cec5058bd61490115c5eac08b2  
-+    target_rank = parts[-2]           # 2  
-+    kv_type = parts[-1]              # v  
-+      
-+    print(f"查询基础hash: {base_hash}")  
-+    print(f"目标rank: {target_rank}, 类型: {kv_type}")  
-+    print("=" * 80)  
-+      
-+    # 检查目标key是否存在  
-+    target_exists = store.exists(target_key)  
-+    print(f"目标key {target_key}: {'存在' if target_exists else '不存在'}")  
-+      
-+    # 查询其他rank版本 (假设rank范围0-7)  
-+    print(f"\n查询基础hash {base_hash} 在其他rank下的存在情况:")  
-+    existing_ranks = []  
-+      
-+    for rank in range(8):  # 假设最多8个rank  
-+        k_key = f"{base_hash}_{rank}_k"  
-+        v_key = f"{base_hash}_{rank}_v"  
-+          
-+        k_exists = store.exists(k_key)  
-+        v_exists = store.exists(v_key)  
-+          
-+        if k_exists and v_exists:  
-+            existing_ranks.append(rank)  
-+            print(f"  Rank {rank}: K和V都存在 ✓")  
-+        elif k_exists:  
-+            print(f"  Rank {rank}: 仅K存在 ⚠️")  
-+        elif v_exists:  
-+            print(f"  Rank {rank}: 仅V存在 ⚠️")  
-+
-+        receive_buffer = torch.zeros(1000, dtype=torch.float32)  
-+        receive_location = receive_buffer.data_ptr()  
-+        receive_size = receive_buffer.numel() * receive_buffer.element_size()  
-+            
-+        # 获取数据  
-+        success = store.get(v_key, receive_location, receive_size)  
-+        if success:  
-+            print(f"成功获取数据，大小: {receive_size} bytes")  
-+            print(f"数据前10个值: {receive_buffer}")  
-+        else:  
-+            print("获取数据失败")             
-+      
-+    print(f"\n总结: 基础hash {base_hash} 在以下rank中存在完整KV数据: {existing_ranks}")  
-+      
-+
-+  
-+if __name__ == "__main__":  
-+    # 确保设置了必要的环境变量  
-+    required_env_vars = [  
-+        "MOONCAKE_MASTER",  
-+        "MOONCAKE_PROTOCOL",   
-+        "MOONCAKE_GLOBAL_SEGMENT_SIZE"  
-+    ]  
-+      
-+    missing_vars = [var for var in required_env_vars if not os.getenv(var)]  
-+    if missing_vars:  
-+        print(f"请设置以下环境变量: {', '.join(missing_vars)}")  
-+        print("示例:")  
-+        print("export MOONCAKE_MASTER='127.0.0.1:50051'")  
-+        print("export MOONCAKE_PROTOCOL='rdma'")  
-+        print("export MOONCAKE_GLOBAL_SEGMENT_SIZE='4gb'")  
-+    else:  
-+        query_mooncake_key_and_ranks()
-\ No newline at end of file
+-        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
++        if os.environ.get("ENABLE_ROUTING_REPLAY", "1") == "1":
+             routing_replay_stage = os.environ["ROUTING_REPLAY_STAGE"]
+             if routing_replay_stage == "fallthrough":
+                 return old_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+@@ -83,7 +173,7 @@ def get_routing_replay_compute_topk(old_compute_topk):
+ 
+ 
+ def register_routing_replay(module):
+-    if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
++    if os.environ.get("ENABLE_ROUTING_REPLAY", "1") == "1":
+         module.routing_replay = RoutingReplay()
+ 
+         def pre_forward_hook(*args, **kwargs):
