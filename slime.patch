@@ -16,7 +16,7 @@ index 0000000..9dbe2f7
 +{"data_source":"math_dapo","prompt":[{"content":"Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\nSuppose you have a sphere tangent to the $xy$-plane with its center having a positive $z$-coordinate. If it is projected from a point $P=(0,b,a)$ to the $xy$-plane, it gives the conic section $y=x^2$. If we write $a=\\frac{p}{q}$ where $p$ and $q$ are integers, find $p+q$.\n\nRemember to put your answer on its own line after \"Answer:\".","role":"user"}],"ability":"MATH","reward_model":{"ground_truth":"3","style":"rule-lighteval\/MATH_v2"},"extra_info":{"index":"e4eede97-5bed-4a2a-9b64-5de4e8cde3e8"}}
 diff --git a/scripts/run-moonlight.sh b/scripts/run-moonlight.sh
 new file mode 100755
-index 0000000..7527ebb
+index 0000000..4282684
 --- /dev/null
 +++ b/scripts/run-moonlight.sh
 @@ -0,0 +1,222 @@
@@ -45,7 +45,7 @@ index 0000000..7527ebb
 +export MOONCAKE_PROTOCOL="rdma"
 +# export GLOG_v=3  # 更详细的日志级别
 +
-+LOG_FILE="./mooncake_$(date +'%Y%m%d_%H%M%S').log" && mooncake_master  --rpc_thread_num=128  --default_kv_lease_ttl=3000000  &> "$LOG_FILE" &
++LOG_FILE="./mooncake_$(date +'%Y%m%d_%H%M%S').log" && mooncake_master  --rpc_thread_num=256  --default_kv_lease_ttl=30000000  &> "$LOG_FILE" &
 +
 +NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 +if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -78,13 +78,13 @@ index 0000000..7527ebb
 +   # --rollout-shuffle
 +   --rm-type deepscaler
 +   --num-rollout 10
-+   --rollout-batch-size 100
++   --rollout-batch-size 200
 +   --n-samples-per-prompt 1
 +   --rollout-max-response-len 7800
 +   --rollout-temperature 0.8
 +   --use-rollout-routing-replay 
 +   # --use-slime-router
-+   --over-sampling-batch-size 100
++   --over-sampling-batch-size 200
 +   # --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
 +
 +   --num-steps-per-rollout 1
@@ -303,7 +303,7 @@ index 3b3e6f4..f903fe5 100644
                  )
              )
 diff --git a/slime/utils/routing_replay.py b/slime/utils/routing_replay.py
-index 8647281..71eb921 100644
+index 8647281..6d7d49a 100644
 --- a/slime/utils/routing_replay.py
 +++ b/slime/utils/routing_replay.py
 @@ -1,6 +1,12 @@
@@ -330,7 +330,7 @@ index 8647281..71eb921 100644
  
  class RoutingReplay:
      all_routing_replays = []
-@@ -53,7 +62,144 @@ class RoutingReplay:
+@@ -53,10 +62,142 @@ class RoutingReplay:
          for replay in RoutingReplay.all_routing_replays:
              replay.clear_forward()
  
@@ -381,7 +381,7 @@ index 8647281..71eb921 100644
 +        host_kv_cache = MLATokenToKVPoolHost(
 +            device_pool=LightweightMHAPool(),
 +            host_to_device_ratio=2.0,
-+            host_size = 1,
++            host_size = 5,
 +            page_size=1,
 +            layout="page_first",
 +            pin_memory=False,
@@ -412,10 +412,8 @@ index 8647281..71eb921 100644
 +        pending_indices = torch.arange(total_keys, dtype=torch.long)
 +
 +        round_id = 0
-+        sleep_interval = 0.1  # 可以调小，RDMA 压力可控
-+        while pending_keys:
-+            while store.batch_exists(pending_keys) != len(pending_keys):
-+                sleep(sleep_interval)
++        while pending_keys and round_id < 5:
++            sleep(1)
 +            round_id += 1
 +            batch_get_start = time.time()
 +            results = store.batch_get_v1(pending_keys, torch.tensor(pending_indices, dtype=torch.long))
@@ -440,10 +438,13 @@ index 8647281..71eb921 100644
 +            print(
 +                f"[Round {round_id}] ✅ new hits={hit}, "
 +                f"done={done_cnt}/{total_keys}, "
++                f"miss={total_keys-done_cnt}/{total_keys}, "
 +                f"batch_get={batch_get_time:.4f}s",
 +                flush=True
 +            )
 +        print(f"⏱️ KV 全量获取完成，用时 {time.time() - get_start:.4f}s", flush=True)
++        for i in pending_indices:
++            print_to_file(i)
 +
 +        # =====================================================
 +        # 结果处理（与你原来一致）
@@ -461,13 +462,7 @@ index 8647281..71eb921 100644
 +            n = len(token_ids)
 +
 +            token_data = all_data_pages[token_offset: token_offset + n]
-+            invalid_mask = (token_data != expected_row).any(dim=-1)  # shape: [n]
 +
-+            if invalid_mask.any():
-+                token_data[invalid_mask] = expected_row
-+
-+            result_list.append(token_data)
-+            token_offset += n
 +
 +        print(f"⏱️ 结果处理，用时 {time.time() - process_start:.4f}s", flush=True)
 +        print(f"⏱️ 总用时 {time.time() - total_start:.4f}s", flush=True)
@@ -475,17 +470,17 @@ index 8647281..71eb921 100644
 +    
  def get_routing_replay_compute_topk(old_compute_topk):
      def compute_topk(scores, topk, num_groups=None, group_topk=None):
-         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
-@@ -68,7 +214,11 @@ def get_routing_replay_compute_topk(old_compute_topk):
-                 assert (
-                     top_indices.shape[0] == scores.shape[0] and top_indices.shape[1] == topk
-                 ), f"[{torch.distributed.get_rank()}] top_indices shape {top_indices.shape} does not match scores shape {scores.shape} and topk {topk}"
--                probs = scores.gather(1, top_indices)
-+                try:
-+                    probs = scores.gather(1, top_indices)
-+                except:
-+                    # print_to_file(top_indices)
-+                    return
-             elif routing_replay_stage == "replay_backward":
-                 top_indices = ROUTING_REPLAY.pop_backward()
-                 assert (
+-        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
++        if os.environ.get("ENABLE_ROUTING_REPLAY", "1") == "1":
+             routing_replay_stage = os.environ["ROUTING_REPLAY_STAGE"]
+             if routing_replay_stage == "fallthrough":
+                 return old_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+@@ -83,7 +224,7 @@ def get_routing_replay_compute_topk(old_compute_topk):
+ 
+ 
+ def register_routing_replay(module):
+-    if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
++    if os.environ.get("ENABLE_ROUTING_REPLAY", "1") == "1":
+         module.routing_replay = RoutingReplay()
+ 
+         def pre_forward_hook(*args, **kwargs):

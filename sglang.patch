@@ -1,45 +1,26 @@
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 1450c5f..8ca2ba6 100644
+index 1450c5f..5812091 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -516,6 +516,7 @@ class Req:
+@@ -726,7 +726,7 @@ class Req:
+             assert (
+                 not self.kv_committed_freed
+             ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+-            self.kv_committed_freed = True
++            # self.kv_committed_freed = True
+             return self.kv_committed_len
+         else:
+             return len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
+@@ -740,7 +740,7 @@ class Req:
+         assert (
+             not self.kv_overallocated_freed
+         ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+-        self.kv_overallocated_freed = True
++        # self.kv_overallocated_freed = True
+         return self.kv_committed_len, self.kv_allocated_len
  
-         # Memory pool info
-         self.req_pool_idx: Optional[int] = None
-+        self.moe_req_pool_idx: Optional[int] = None
-         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
- 
-         # Check finish
-@@ -553,13 +554,17 @@ class Req:
-         # Prefix info
-         # The indices to kv cache for the shared prefix.
-         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
-+        self.moe_prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
-         # Number of tokens to run prefill.
-         self.extend_input_len = 0
-         # The relative logprob_start_len in an extend batch
-         self.extend_logprob_start_len = 0
-         self.last_node: Any = None
-+        self.moe_last_node: Any = None
-         self.last_host_node: Any = None
-+        self.moe_last_host_node: Any = None
-         self.host_hit_length = 0
-+        self.moe_host_hit_length = 0
-         # The node to lock until for swa radix tree lock ref
-         self.swa_uuid_for_lock: Optional[int] = None
-         # The prefix length that is inserted into the tree cache
-@@ -999,8 +1004,10 @@ class Req:
-         self.retraction_count += 1
- 
-         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
-+        self.moe_prefix_indices = torch.empty((0,), dtype=torch.int64)
-         self.routed_experts = []
-         self.last_node = None
-+        self.moe_last_node= None                            
-         self.swa_uuid_for_lock = None
-         self.extend_input_len = 0
-         self.is_retracted = True
-@@ -1069,8 +1076,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+     def add_latency(self, stage: RequestStage):
+@@ -1069,8 +1069,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
      # Request, memory pool, and cache
      reqs: List[Req]
      req_to_token_pool: ReqToTokenPool = None
@@ -51,27 +32,7 @@ index 1450c5f..8ca2ba6 100644
      is_hybrid_swa: bool = False
  
      # Batch configs
-@@ -1097,6 +1107,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
-     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
-     # The output locations of the KV cache
-     out_cache_loc: torch.Tensor = None  # shape: [b], int64
-+    moe_out_cache_loc: torch.Tensor = None
-     output_ids: torch.Tensor = None  # shape: [b], int64
- 
-     # For multimodal inputs
-@@ -1127,8 +1138,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
- 
-     # For extend and mixed chunekd prefill
-     prefix_lens: List[int] = None
-+    moe_prefix_lens: List[int] = None    
-     extend_lens: List[int] = None
-+    moe_extend_lend: List[int] = None
-     extend_num_tokens: Optional[int] = None
-+    moe_extend_num_tokens: Optional[int] = None
-     decoding_reqs: List[Req] = None
-     extend_logprob_start_lens: List[int] = None
-     # It comes empty list if logprob is not required.
-@@ -1184,8 +1198,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1184,8 +1187,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
          cls,
          reqs: List[Req],
          req_to_token_pool: ReqToTokenPool,
@@ -83,7 +44,7 @@ index 1450c5f..8ca2ba6 100644
          model_config: ModelConfig,
          enable_overlap: bool,
          spec_algorithm: SpeculativeAlgorithm,
-@@ -1206,8 +1223,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1206,8 +1212,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
          return cls(
              reqs=reqs,
              req_to_token_pool=req_to_token_pool,
@@ -95,124 +56,15 @@ index 1450c5f..8ca2ba6 100644
              is_hybrid_swa=is_hybrid_swa,
              model_config=model_config,
              enable_overlap=enable_overlap,
-@@ -1316,7 +1336,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
-         seq_lens = [len(r.fill_ids) for r in reqs]
-         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
-         prefix_lens = [len(r.prefix_indices) for r in reqs]
-+        moe_prefix_lens = [len(r.moe_prefix_indices) for r in reqs] # always 0 [0, 0, 0, ...]
-         extend_lens = [r.extend_input_len for r in reqs]
-+        moe_extend_lens = extend_lens
- 
-         # For matryoshka embeddings
-         if self.model_config.is_matryoshka and any(
-@@ -1350,13 +1372,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
- 
-         # Set batch fields needed by alloc_for_extend
-         self.prefix_lens = prefix_lens
-+        self.moe_prefix_lens = moe_prefix_lens        
-         self.extend_lens = extend_lens
-+        self.moe_extend_lens = moe_extend_lens        
-         self.seq_lens = seq_lens_tensor
-         self.seq_lens_cpu = seq_lens_cpu
-         self.extend_num_tokens = extend_num_tokens
-+        self.moe_extend_num_tokens = extend_num_tokens
- 
-         # Allocate memory
--        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-+        out_cache_loc, moe_out_cache_loc, req_pool_indices_tensor, moe_req_pool_indices_tensor, req_pool_indices, moe_req_pool_indices = alloc_for_extend(
-             self
-         )
- 
-@@ -1365,8 +1390,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
-         extend_input_logprob_token_ids = []
-         multimodal_inputs = []
- 
-+        for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-+            req.moe_req_pool_idx = moe_req_pool_indices[i]
-+
-         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-             req.req_pool_idx = req_pool_indices[i]
-+            req.moe_req_pool_idx = moe_req_pool_indices[i]
-             assert seq_len - pre_len == req.extend_input_len
- 
-             # update req-level memory management fields
-@@ -1467,8 +1496,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
- 
-         self.input_ids = input_ids_tensor
-         self.req_pool_indices = req_pool_indices_tensor
-+        self.moe_req_pool_indices = moe_req_pool_indices_tensor
-         self.orig_seq_lens = orig_seq_lens_tensor
-         self.out_cache_loc = out_cache_loc
-+        self.moe_out_cache_loc = moe_out_cache_loc
-         self.out_cache_loc_cpu = out_cache_loc.cpu()
-         self.input_embeds = (
-             torch.tensor(input_embeds).to(self.device, non_blocking=True)
-@@ -1676,10 +1707,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1676,7 +1685,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                  self.req_to_token_pool, self.token_to_kv_pool_allocator
              )
          # TODO (csy): for preempted requests, we may want to insert into the tree
 -        release_kv_cache(req, self.tree_cache, is_insert=False)
-+        release_kv_cache(req, self.tree_cache, self.moe_tree_cache, is_insert=False)
++        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
          # NOTE(lsyin): we should use the newly evictable memory instantly.
          num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
          evict_from_tree_cache(self.tree_cache, num_tokens)
-+        evict_from_tree_cache(self.moe_tree_cache, num_tokens)
- 
-         req.reset_for_retract()
- 
-@@ -1696,6 +1728,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
-         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
-         self.out_cache_loc_cpu = torch.empty(0, dtype=torch.int64, device="cpu")
-         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
-+        self.moe_out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)  
-+        self.moe_req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)  
-+        self.moe_extend_num_tokens = 0    
-         self.seq_lens_sum = 0
-         self.extend_num_tokens = 0
-         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-@@ -1753,7 +1788,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
-             self.prepare_encoder_info_decode()
- 
-         # Allocate memory
--        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
-+        self.out_cache_loc, self.moe_out_cache_loc = alloc_for_decode(self, token_per_req=1)
-         self.out_cache_loc_cpu = self.out_cache_loc.to("cpu", non_blocking=True)
- 
-         # Update req-level memory management fields
-@@ -1822,6 +1857,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
-         if self.multimodal_inputs is not None:
-             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
-         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
-+        self.moe_req_pool_indices = self.moe_req_pool_indices[keep_indices_device]
-         self.seq_lens = self.seq_lens[keep_indices_device]
-         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
-         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
-@@ -1868,6 +1904,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
-         self.req_pool_indices = torch.cat(
-             [self.req_pool_indices, other.req_pool_indices]
-         )
-+        self.moe_req_pool_indices = torch.cat(
-+            [self.moe_req_pool_indices, other.moe_req_pool_indices]
-+        )
-         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
-         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
-@@ -1924,6 +1963,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
-             seq_lens=self.seq_lens,
-             orig_seq_lens=self.orig_seq_lens,
-             out_cache_loc=self.out_cache_loc,
-+            moe_out_cache_loc=self.moe_out_cache_loc,
-             out_cache_loc_cpu=self.out_cache_loc_cpu,
-             seq_lens_cpu=seq_lens_cpu,
-             seq_lens_sum=self.seq_lens_sum,
-@@ -2022,6 +2062,7 @@ class ModelWorkerBatch:
-     seq_lens: torch.Tensor
-     # The indices of output tokens in the token_to_kv_pool_allocator
-     out_cache_loc: torch.Tensor
-+    moe_out_cache_loc: torch.Tensor
-     # The sequence length tensor on CPU
-     seq_lens_cpu: Optional[torch.Tensor]
-     seq_lens_sum: int
 diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
 index d6d1172..85cb043 100644
 --- a/python/sglang/srt/managers/schedule_policy.py
@@ -233,7 +85,7 @@ index d6d1172..85cb043 100644
          self.enable_priority_scheduling = enable_priority_scheduling
          self.schedule_low_priority_values_first = schedule_low_priority_values_first
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 9e27cc8..72c0ce2 100644
+index 9e27cc8..25b573f 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -35,6 +35,7 @@ from torch.cuda import Stream as CudaStream
@@ -261,24 +113,26 @@ index 9e27cc8..72c0ce2 100644
              self.tp_worker.get_memory_pool()
          )
  
-@@ -813,6 +815,28 @@ class Scheduler(
+@@ -813,6 +815,30 @@ class Scheduler(
          embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
          init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
  
 +
 +        moe_server_args = ServerArgs(
-+            hicache_mem_layout="page_first",
 +            hicache_io_backend="kernel", 
-+            hicache_size=10,           
++            hicache_mem_layout="page_first",
++            hicache_ratio=2,
++            hicache_size=60, 
 +            hicache_storage_backend="mooncake",  
-+            served_model_name="moe_model",
++            hicache_write_policy="write_through", # 写策略
 +            model_path=self.server_args.model_path
 +        )
++
 +        moe_params = CacheInitParams(
 +            disable=False,
 +            req_to_token_pool=self.moe_req_to_token_pool,
 +            token_to_kv_pool_allocator=self.moe_token_to_kv_pool_allocator,
-+            page_size=1,
++            page_size=self.page_size,
 +            tp_cache_group=(
 +                self.attn_tp_cpu_group
 +                if self.server_args.enable_dp_attention
@@ -290,24 +144,7 @@ index 9e27cc8..72c0ce2 100644
      def init_disaggregation(self):
          self.disaggregation_mode = DisaggregationMode(
              self.server_args.disaggregation_mode
-@@ -1461,7 +1485,7 @@ class Scheduler(
- 
-     def _prefetch_kvcache(self, req: Req):
-         if self.enable_hicache_storage:
--            req.init_next_round_input(self.tree_cache)
-+            req.init_next_round_input(self.tree_cache, self.moe_tree_cache)
-             if req.last_node.backuped:
-                 # only to initiate the prefetch if the last node is backuped
-                 # otherwise, the allocated GPU memory must be locked for integrity
-@@ -1805,7 +1829,6 @@ class Scheduler(
-                 if not prefetch_done:
-                     # skip staging requests that are ongoing prefetch
-                     continue
--
-             req.init_next_round_input(self.tree_cache)
-             res = adder.add_one_req(
-                 req,
-@@ -1865,8 +1888,11 @@ class Scheduler(
+@@ -1865,8 +1891,11 @@ class Scheduler(
          new_batch = ScheduleBatch.init_new(
              can_run_list,
              self.req_to_token_pool,
@@ -319,7 +156,7 @@ index 9e27cc8..72c0ce2 100644
              self.model_config,
              self.enable_overlap,
              self.spec_algorithm,
-@@ -2232,10 +2258,13 @@ class Scheduler(
+@@ -2232,10 +2261,13 @@ class Scheduler(
              self.cur_batch = None
              self.last_batch = None
              self.tree_cache.reset()
@@ -333,7 +170,7 @@ index 9e27cc8..72c0ce2 100644
  
              if self.draft_worker:
                  self.draft_worker.clear_cache_pool()
-@@ -2361,6 +2390,7 @@ class Scheduler(
+@@ -2361,6 +2393,7 @@ class Scheduler(
              if self.enable_hicache_storage:
                  # to release prefetch events associated with the request
                  self.tree_cache.release_aborted_request(req.rid)
@@ -342,37 +179,65 @@ index 9e27cc8..72c0ce2 100644
              # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
              if self.disaggregation_mode == DisaggregationMode.DECODE:
 diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-index a9796c2..cfff894 100644
+index a9796c2..1d01ca3 100644
 --- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
 +++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-@@ -56,7 +56,7 @@ class SchedulerOutputProcessorMixin:
+@@ -56,7 +56,8 @@ class SchedulerOutputProcessorMixin:
                      req.rid,
                      thread_finish_flag=True,
                  )
 -                release_kv_cache(req, self.tree_cache)
-+                release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
++                release_kv_cache(req, self.tree_cache,
++                                 self.moe_tree_cache)
  
          # Note: Logprobs should be handled on the prefill engine.
          trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
-@@ -121,7 +121,7 @@ class SchedulerOutputProcessorMixin:
+@@ -121,11 +122,13 @@ class SchedulerOutputProcessorMixin:
                              )
                          )
  
 -                        release_kv_cache(req, self.tree_cache)
-+                        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
++                        release_kv_cache(req, self.tree_cache, 
++                                         self.moe_tree_cache)
                          req.time_stats.completion_time = time.perf_counter()
                      elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                          # This updates radix so others can match
-@@ -250,7 +250,7 @@ class SchedulerOutputProcessorMixin:
+                         self.tree_cache.cache_unfinished_req(req)
++                        self.moe_tree_cache.cache_unfinished_req(req)
+ 
+                     if batch.return_logprob:
+                         assert extend_logprob_start_len_per_req is not None
+@@ -250,9 +253,12 @@ class SchedulerOutputProcessorMixin:
                      req.check_finished()
  
                      if req.finished():
 -                        release_kv_cache(req, self.tree_cache)
-+                        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
++                        release_kv_cache(req, self.tree_cache, 
++                        self.moe_tree_cache)
                      else:
                          self.tree_cache.cache_unfinished_req(req)
++                        self.moe_tree_cache.cache_unfinished_req(req)
++
                  else:
-@@ -382,7 +382,7 @@ class SchedulerOutputProcessorMixin:
+                     # being chunked reqs' prefill is not finished
+                     req.is_chunked -= 1
+@@ -311,11 +317,14 @@ class SchedulerOutputProcessorMixin:
+             req.check_finished()
+ 
+             if req.finished():
+-                release_kv_cache(req, self.tree_cache)
++                release_kv_cache(req, self.tree_cache, 
++                self.moe_tree_cache)
+                 req.time_stats.completion_time = time.perf_counter()
+                 break
+ 
+             self.tree_cache.cache_unfinished_req(req)
++            self.moe_tree_cache.cache_unfinished_req(req)
++
+ 
+         self.stream_output(batch.reqs, batch.return_logprob)
+         self.token_to_kv_pool_allocator.free_group_end()
+@@ -382,7 +391,7 @@ class SchedulerOutputProcessorMixin:
                      if not self.decode_offload_manager.offload_kv_cache(req):
                          release_kv_cache(req, self.tree_cache)
                  else:
@@ -380,6 +245,33 @@ index a9796c2..cfff894 100644
 +                    release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
  
                  req.time_stats.completion_time = time.perf_counter()
+ 
+diff --git a/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py b/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py
+index 09f1ba5..8e252fb 100644
+--- a/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py
++++ b/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py
+@@ -209,14 +209,14 @@ class SchedulerRuntimeCheckerMixin:
+         else:
+             memory_leak, token_msg = self._check_radix_cache_memory()
+ 
+-        if memory_leak:
+-            msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+-            raise_error_or_warn(
+-                self,
+-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+-                "count_memory_leak_warnings",
+-                msg,
+-            )
++        # if memory_leak:
++        #     msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
++        #     raise_error_or_warn(
++        #         self,
++        #         envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
++        #         "count_memory_leak_warnings",
++        #         msg,
++        #     )
+ 
+         self._check_req_pool()
  
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
 index f37138a..026f410 100644
@@ -395,53 +287,15 @@ index f37138a..026f410 100644
  
      def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
 diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
-index 48bbb36..5e8bd1a 100644
+index 48bbb36..b944163 100644
 --- a/python/sglang/srt/mem_cache/common.py
 +++ b/python/sglang/srt/mem_cache/common.py
-@@ -338,6 +338,7 @@ def alloc_for_extend(
- 
-     bs = len(batch.reqs)
-     prefix_tensors = [r.prefix_indices for r in batch.reqs]
-+    moe_prefix_tensors = [r.moe_prefix_indices for r in batch.reqs]   
- 
-     # Create tensors for allocation
-     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-@@ -345,16 +346,28 @@ def alloc_for_extend(
-     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
-     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
- 
-+    moe_prefix_lens_cpu = torch.tensor(batch.moe_prefix_lens, dtype=torch.int64)  
-+    moe_extend_lens_cpu = torch.tensor(batch.moe_extend_lens, dtype=torch.int64)  
-+    moe_prefix_lens_device = moe_prefix_lens_cpu.to(batch.device, non_blocking=True)
-+    moe_extend_lens_device = moe_extend_lens_cpu.to(batch.device, non_blocking=True)
-+
-     # Allocate req slots
-     req_pool_indices = alloc_req_slots(
-         batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
-     )
-+    moe_req_pool_indices = alloc_req_slots(
-+        batch.moe_req_to_token_pool, bs, batch.reqs, batch.moe_tree_cache
-+    )
-     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
- 
-+    moe_req_pool_indices_cpu = torch.tensor(moe_req_pool_indices, dtype=torch.int64)
-+    moe_req_pool_indices_device = moe_req_pool_indices_cpu.to(batch.device, non_blocking=True)
-+
-     # Allocate KV cache (throws exception on failure)
-     if batch.tree_cache.page_size == 1:
-         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
-+        moe_out_cache_loc = alloc_token_slots(batch.moe_tree_cache, batch.extend_num_tokens)
-     else:
-         # Paged allocation - build last_loc
-         last_loc = [
-@@ -385,8 +398,20 @@ def alloc_for_extend(
+@@ -385,7 +385,19 @@ def alloc_for_extend(
          prefix_tensors,
          batch.req_to_token_pool,
      )
 -
--    return out_cache_loc, req_pool_indices_device, req_pool_indices
-+    write_cache_indices(
++    write_cache_indices(  
 +        out_cache_loc,
 +        req_pool_indices_device,
 +        req_pool_indices_cpu,
@@ -452,74 +306,34 @@ index 48bbb36..5e8bd1a 100644
 +        extend_lens_device,
 +        extend_lens_cpu,
 +        prefix_tensors,
-+        batch.moe_req_to_token_pool,
-+    )     
-+    return out_cache_loc, out_cache_loc, req_pool_indices_device, req_pool_indices_device, req_pool_indices, req_pool_indices
++        batch.moe_req_to_token_pool,  
++    )      
+     return out_cache_loc, req_pool_indices_device, req_pool_indices
  
  
- def alloc_paged_token_slots_decode(
-@@ -436,6 +461,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
-     if batch.tree_cache.page_size == 1:
-         # Non-paged allocation
-         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
-+        moe_cache_loc = alloc_token_slots(batch.moe_tree_cache, bs * token_per_req)  
-     else:
-         # Paged allocation
-         last_loc = batch.req_to_token_pool.req_to_token[
-@@ -449,6 +475,16 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
-             last_loc=last_loc,
-             token_per_req=token_per_req,
-         )
-+        moe_last_loc = batch.moe_req_to_token_pool.req_to_token[  
-+            batch.moe_req_pool_indices, batch.seq_lens - 1  
-+        ]  
-+        moe_cache_loc = alloc_paged_token_slots_decode(  
-+            tree_cache=batch.moe_tree_cache,  
-+            seq_lens=seq_lens_next,  
-+            seq_lens_cpu=batch.seq_lens_cpu + token_per_req,  
-+            last_loc=moe_last_loc,  
-+            token_per_req=token_per_req,
-+        )
- 
-     # Write to req_to_token_pool
-     if batch.model_config.is_encoder_decoder:
-@@ -459,12 +495,18 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+@@ -459,12 +471,15 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
      batch.req_to_token_pool.write(
          (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
      )
 -
--    return out_cache_loc
-+    #todo: bug
 +    batch.moe_req_to_token_pool.write(  
-+        (batch.moe_req_pool_indices, locs), moe_cache_loc.to(torch.int32)  
-+    )    
-+    
-+    return out_cache_loc, moe_cache_loc
++        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
++    )
+     return out_cache_loc
  
  
 -def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-+def release_kv_cache(req: Req, tree_cache: BasePrefixCache, moe_tree_cache: BasePrefixCache = None, is_insert: bool = True):
++def release_kv_cache(req: Req, tree_cache: BasePrefixCache, moe_tree_cache: BasePrefixCache, is_insert: bool = True):
      tree_cache.cache_finished_req(req, is_insert=is_insert)
-+    if moe_tree_cache is not None:
-+        moe_tree_cache.cache_finished_req(req, is_insert=is_insert)
++    moe_tree_cache.cache_finished_req(req, is_insert=is_insert)    
      start_p, end_p = req.pop_overallocated_kv_cache()
  
      global_server_args = get_global_server_args()
-@@ -486,6 +528,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
-         start_p:end_p
-     ]
-     tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
-+    if moe_tree_cache is not None:
-+        indices_to_free = moe_tree_cache.req_to_token_pool.req_to_token[req.moe_req_pool_idx][start_p:end_p]
-+        moe_tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
- 
- 
- def available_and_evictable_str(tree_cache) -> str:
 diff --git a/python/sglang/srt/mem_cache/hiradix_cache.py b/python/sglang/srt/mem_cache/hiradix_cache.py
-index 1691fe3..357e047 100644
+index 1691fe3..a4ecb81 100644
 --- a/python/sglang/srt/mem_cache/hiradix_cache.py
 +++ b/python/sglang/srt/mem_cache/hiradix_cache.py
-@@ -944,3 +944,36 @@ class HiRadixCache(RadixCache):
+@@ -944,3 +944,89 @@ class HiRadixCache(RadixCache):
          del self.ongoing_prefetch[rid]
          self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
          self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
@@ -529,136 +343,127 @@ index 1691fe3..357e047 100644
 +    def __init__(self, params, server_args):  
 +        super().__init__(params, server_args)
 +        
-+    def cache_finished_req(self, req, is_insert: bool = True): 
-+        all_token_len = len(req.origin_input_ids) + len(req.output_ids)  
-+        moe_indices = self.req_to_token_pool.req_to_token[  
-+            req.moe_req_pool_idx, :all_token_len  
-+        ]  
-+    
-+        assert self.page_size == 1
-+        page_aligned_len = all_token_len  
-+        page_aligned_moe_indices = moe_indices.to(dtype=torch.int64, copy=True)  
-+    
-+        token_ids = (req.origin_input_ids + req.output_ids)[:page_aligned_len]
-+        old_prefix_len = len(req.moe_prefix_indices) if req.moe_prefix_indices is not None else 0  
-+    
-+        new_prefix_len = self.insert(  
-+            RadixKey(token_ids, req.extra_key),  
-+            page_aligned_moe_indices,  
-+        )  
-+        if old_prefix_len < new_prefix_len:  
-+            self.token_to_kv_pool_allocator.free(  
-+                moe_indices[old_prefix_len:new_prefix_len]  
-+            )  
-+        self.check_hicache_events()                          
-+    
-+        if page_aligned_len < all_token_len:  
-+            self.token_to_kv_pool_allocator.free(moe_indices[page_aligned_len:])  
++    def cache_finished_req(self, req: Req, is_insert: bool = True):
++        token_ids = (req.origin_input_ids + req.output_ids)
++        kv_indices = self.req_to_token_pool.req_to_token[
++            req.req_pool_idx, : len(token_ids)
++        ]
 +
-+        self.req_to_token_pool.free(req.moe_req_pool_idx)       
++        values = kv_indices[: len(token_ids)].to(dtype=torch.int64, copy=True)
++        radix_key = RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle)
++
++        if is_insert:
++            priority = getattr(req, "priority", 0) or 0
++            new_prefix_len = self.insert(radix_key, values, priority=priority)
++            self.check_hicache_events()
++
++        # self.dec_lock_ref(req.last_node)
++    
++    def cache_unfinished_req(self, req: Req, chunked=False):
++        """Cache request when it is unfinished."""
++        if self.disable:
++            return
++
++        token_ids = req.fill_ids
++        kv_indices = self.req_to_token_pool.req_to_token[
++            req.req_pool_idx, : len(token_ids)
++        ]
++
++        # Maybe convert to bigram keys for EAGLE
++        keys = super().convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
++        keys = self._page_align_keys(keys)
++        values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
++        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
++
++        # Radix Cache takes one ref in memory pool
++        new_prefix_len = self.insert(
++            radix_key,
++            values,
++            chunked=chunked,
++            priority=getattr(req, "priority", 0) or 0,
++        )
++
++        self.token_to_kv_pool_allocator.free(
++            kv_indices[req.cache_protected_len : new_prefix_len]
++        )
++
++        # The prefix indices could be updated, reuse it
++        match_result = self.match_prefix(radix_key)
++        (new_indices, new_last_node) = (
++            match_result.device_indices,
++            match_result.last_device_node,
++        )
++        assert len(new_indices) == len(keys), f"{len(new_indices)=}, {len(keys)=}"
++
++        self.req_to_token_pool.write(
++            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
++            new_indices[req.cache_protected_len :],
++        )
++
++        # The cache_protected_len is not always equal to len(req.prefix_indices)
++        # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
++        # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak.
++        # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
++        req.cache_protected_len = len(new_indices)
++
++        # self.dec_lock_ref(req.last_node)
++        self.inc_lock_ref(new_last_node)
++
++        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
++        # - page_size != 1: there is a partial page at the end, keep the full kv_indices
++        # - eagle case: bigram keys will only cache len - 1 kv indices
++        if len(new_indices) < len(kv_indices):
++            req.prefix_indices = torch.cat(
++                [new_indices, kv_indices[len(new_indices) :]]
++            )
++        else:
++            req.prefix_indices = new_indices
++
++        # req.last_node = new_last_node
++        self.check_hicache_events()
++    
++
 diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
-index 7cefcfa..369aee2 100644
+index 7cefcfa..cff1e0e 100644
 --- a/python/sglang/srt/model_executor/cuda_graph_runner.py
 +++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
-@@ -539,6 +539,7 @@ class CudaGraphRunner:
-         seq_lens = buffers.seq_lens[:bs]
-         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
-         out_cache_loc = buffers.out_cache_loc[:num_tokens]
-+        moe_out_cache_loc = buffers.moe_out_cache_loc[:num_tokens]
-         positions = buffers.positions[:num_tokens]
-         if self.is_encoder_decoder:
-             encoder_lens = buffers.encoder_lens[:bs]
-@@ -619,8 +620,10 @@ class CudaGraphRunner:
+@@ -619,6 +619,7 @@ class CudaGraphRunner:
              orig_seq_lens=seq_lens,
              req_to_token_pool=self.model_runner.req_to_token_pool,
              token_to_kv_pool=self.model_runner.token_to_kv_pool,
 +            moe_token_to_kv_pool=self.model_runner.moe_token_to_kv_pool,
              attn_backend=attn_backend,
              out_cache_loc=out_cache_loc,
-+            moe_out_cache_loc=moe_out_cache_loc,
              seq_lens_sum=seq_lens.sum().item(),
-             encoder_lens=encoder_lens,
-             return_logprob=False,
 diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
-index 2859daf..81dab98 100644
+index 2859daf..5409057 100644
 --- a/python/sglang/srt/model_executor/forward_batch_info.py
 +++ b/python/sglang/srt/model_executor/forward_batch_info.py
-@@ -211,6 +211,7 @@ class ForwardBatch:
-     seq_lens: torch.Tensor
-     # The indices of output tokens in the token_to_kv_pool
-     out_cache_loc: torch.Tensor
-+    moe_out_cache_loc: torch.Tensor
- 
-     # The sum of all sequence lengths
-     seq_lens_sum: int
-@@ -311,7 +312,9 @@ class ForwardBatch:
+@@ -311,7 +311,9 @@ class ForwardBatch:
  
      # Attention backend
      req_to_token_pool: ReqToTokenPool = None
-+    moe_req_to_token_pool: Optional[KVCache] = None  
++    moe_req_to_token_pool: ReqToTokenPool = None  
      token_to_kv_pool: KVCache = None
 +    moe_token_to_kv_pool: Optional[KVCache] = None
      attn_backend: AttentionBackend = None
  
      # For DP attention
-@@ -372,6 +375,7 @@ class ForwardBatch:
-             req_pool_indices=batch.req_pool_indices,
-             seq_lens=batch.seq_lens,
-             out_cache_loc=batch.out_cache_loc,
-+            moe_out_cache_loc=batch.moe_out_cache_loc,
-             out_cache_loc_cpu=batch.out_cache_loc_cpu,
-             mm_inputs=batch.multimodal_inputs,
-             encoder_cached=batch.encoder_cached,
-@@ -400,6 +404,8 @@ class ForwardBatch:
-             token_type_ids=batch.token_type_ids,
-             tbo_split_seq_index=batch.tbo_split_seq_index,
-             dimensions=batch.dimensions,
+@@ -391,7 +393,9 @@ class ForwardBatch:
+             lora_ids=batch.lora_ids,
+             sampling_info=batch.sampling_info,
+             req_to_token_pool=model_runner.req_to_token_pool,
 +            moe_req_to_token_pool=model_runner.moe_req_to_token_pool,  
+             token_to_kv_pool=model_runner.token_to_kv_pool,
 +            moe_token_to_kv_pool=model_runner.moe_token_to_kv_pool,
-         )
-         device = model_runner.device
- 
-diff --git a/python/sglang/srt/model_executor/input_buffers.py b/python/sglang/srt/model_executor/input_buffers.py
-index ec8d234..dcc25e6 100644
---- a/python/sglang/srt/model_executor/input_buffers.py
-+++ b/python/sglang/srt/model_executor/input_buffers.py
-@@ -16,6 +16,7 @@ class GraphInputBuffers:
-     seq_lens: torch.Tensor
-     seq_lens_cpu: torch.Tensor
-     out_cache_loc: torch.Tensor
-+    moe_out_cache_loc: torch.Tensor
-     positions: torch.Tensor
-     mrope_positions: torch.Tensor
-     num_token_non_padded: torch.Tensor
-@@ -51,6 +52,7 @@ class GraphInputBuffers:
-             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int32)
-             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
-             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
-+            moe_out_cache_loc = torch.zeros((max_num_token), dtype=cache_loc_dtype)
-             positions = torch.zeros((max_num_token,), dtype=torch.int64)
-             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
-             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
-@@ -102,6 +104,7 @@ class GraphInputBuffers:
-             seq_lens=seq_lens,
-             seq_lens_cpu=seq_lens_cpu,
-             out_cache_loc=out_cache_loc,
-+            moe_out_cache_loc=moe_out_cache_loc,
-             positions=positions,
-             mrope_positions=mrope_positions,
-             num_token_non_padded=num_token_non_padded,
-@@ -138,6 +141,7 @@ class GraphInputBuffers:
-         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
-+        self.moe_out_cache_loc[:raw_num_token].copy_(forward_batch.moe_out_cache_loc)
-         self.positions[:raw_num_token].copy_(forward_batch.positions)
- 
-         seq_lens_cpu: Optional[torch.Tensor] = None
+             attn_backend=model_runner.attn_backend,
+             spec_algorithm=batch.spec_algorithm,
+             spec_info=batch.spec_info,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 8f50dc4..93a3ac4 100644
+index 8f50dc4..bd4f475 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -2078,6 +2078,33 @@ class ModelRunner:
+@@ -2078,6 +2078,28 @@ class ModelRunner:
          else:
              assert self.is_draft_worker
  
@@ -666,14 +471,14 @@ index 8f50dc4..93a3ac4 100644
 +            size=self.max_total_num_tokens,  
 +            page_size=1,  
 +            dtype=torch.int32,  
-+            kv_lora_rank=0,
-+            qk_rope_head_dim=self.model_config.hf_config.num_experts_per_tok, 
++            kv_lora_rank=self.model_config.hf_config.num_experts_per_tok,
++            qk_rope_head_dim=0, 
 +            layer_num=self.num_effective_layers,  
 +            device=self.device,  
-+            enable_memory_saver=True,  
++            enable_memory_saver=False,  
 +            start_layer=self.start_layer,  
 +            end_layer=self.end_layer
-+            )            
++            )                      
 +          
 +        self.moe_token_to_kv_pool_allocator = TokenToKVPoolAllocator(  
 +            size=self.max_total_num_tokens,  
@@ -682,18 +487,13 @@ index 8f50dc4..93a3ac4 100644
 +            kvcache=self.moe_token_to_kv_pool,  
 +            need_sort=False,  
 +        )            
-+        self.moe_req_to_token_pool = ReqToTokenPool(  
-+            size=self.req_to_token_pool.size, 
-+            max_context_len=self.model_config.context_len,
-+            device=self.device,  
-+            enable_memory_saver=True,  
-+        )            
++        self.moe_req_to_token_pool = self.req_to_token_pool
 +
          logger.info(
              f"Memory pool end. "
              f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index f29dc4b..540cd50 100644
+index f29dc4b..47fac1a 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
 @@ -783,21 +783,29 @@ class DeepseekV2MoE(nn.Module):
@@ -721,9 +521,9 @@ index f29dc4b..540cd50 100644
 +
 +        forward_batch.moe_token_to_kv_pool.set_kv_buffer(    
 +            layer=self,    
-+            loc=forward_batch.moe_out_cache_loc,    
-+            cache_k=topk_output.topk_ids.unsqueeze(1),
-+            cache_v=topk_output.topk_ids.unsqueeze(1)
++            loc=forward_batch.out_cache_loc,    
++            cache_k=topk_output.topk_ids.unsqueeze(1),   
++            cache_v=None,   
 +        )  
 +        return final_hidden_states      
  
