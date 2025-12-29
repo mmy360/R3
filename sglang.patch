@@ -1,13 +1,43 @@
+From e80554785defbc2a2786e59199160ee338e62c55 Mon Sep 17 00:00:00 2001
+From: xywang <1003212437@qq.com>
+Date: Mon, 29 Dec 2025 14:11:13 +0800
+Subject: [PATCH] Changes to be committed: 	modified:  
+ python/sglang/srt/managers/schedule_batch.py 	modified:  
+ python/sglang/srt/managers/schedule_policy.py 	modified:  
+ python/sglang/srt/managers/scheduler.py 	modified:  
+ python/sglang/srt/managers/scheduler_output_processor_mixin.py 
+ modified:   python/sglang/srt/managers/tp_worker.py 	modified:  
+ python/sglang/srt/mem_cache/common.py 	modified:  
+ python/sglang/srt/mem_cache/hiradix_cache.py 	modified:  
+ python/sglang/srt/model_executor/cuda_graph_runner.py 	modified:  
+ python/sglang/srt/model_executor/forward_batch_info.py 	modified:  
+ python/sglang/srt/model_executor/model_runner.py 	modified:  
+ python/sglang/srt/models/deepseek_v2.py
+
+---
+ python/sglang/srt/managers/schedule_batch.py  | 16 ++++-
+ python/sglang/srt/managers/schedule_policy.py |  2 +
+ python/sglang/srt/managers/scheduler.py       | 34 ++++++++++-
+ .../scheduler_output_processor_mixin.py       | 18 ++++--
+ python/sglang/srt/managers/tp_worker.py       |  2 +
+ python/sglang/srt/mem_cache/common.py         | 21 ++++++-
+ python/sglang/srt/mem_cache/hiradix_cache.py  | 61 +++++++++++++++++++
+ .../srt/model_executor/cuda_graph_runner.py   |  1 +
+ .../srt/model_executor/forward_batch_info.py  |  4 ++
+ .../sglang/srt/model_executor/model_runner.py | 22 +++++++
+ python/sglang/srt/models/deepseek_v2.py       | 20 ++++--
+ 11 files changed, 181 insertions(+), 20 deletions(-)
+
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 5812091..1450c5f 100644
+index 3650ba8..7d3d0d9 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
 @@ -726,7 +726,7 @@ class Req:
              assert (
                  not self.kv_committed_freed
              ), f"Committed KV cache already freed ({self.kv_committed_len=})"
--            # self.kv_committed_freed = True
-+            self.kv_committed_freed = True
+-            self.kv_committed_freed = True
++            # self.kv_committed_freed = True
              return self.kv_committed_len
          else:
              return len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
@@ -15,492 +45,483 @@ index 5812091..1450c5f 100644
          assert (
              not self.kv_overallocated_freed
          ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
--        # self.kv_overallocated_freed = True
-+        self.kv_overallocated_freed = True
+-        self.kv_overallocated_freed = True
++        # self.kv_overallocated_freed = True
          return self.kv_committed_len, self.kv_allocated_len
  
      def add_latency(self, stage: RequestStage):
-@@ -1069,11 +1069,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1069,8 +1069,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
      # Request, memory pool, and cache
      reqs: List[Req]
      req_to_token_pool: ReqToTokenPool = None
--    moe_req_to_token_pool: ReqToTokenPool = None
++    moe_req_to_token_pool: ReqToTokenPool = None
      token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
--    moe_token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
++    moe_token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
      tree_cache: BasePrefixCache = None
--    moe_tree_cache: BasePrefixCache = None
++    moe_tree_cache: BasePrefixCache = None
      is_hybrid_swa: bool = False
  
      # Batch configs
-@@ -1187,11 +1184,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1184,8 +1187,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
          cls,
          reqs: List[Req],
          req_to_token_pool: ReqToTokenPool,
--        moe_req_to_token_pool: ReqToTokenPool,
++        moe_req_to_token_pool: ReqToTokenPool,
          token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
--        moe_token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
++        moe_token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
          tree_cache: BasePrefixCache,
--        moe_tree_cache: BasePrefixCache,
++        moe_tree_cache: BasePrefixCache,
          model_config: ModelConfig,
          enable_overlap: bool,
          spec_algorithm: SpeculativeAlgorithm,
-@@ -1212,11 +1206,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1206,8 +1212,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
          return cls(
              reqs=reqs,
              req_to_token_pool=req_to_token_pool,
--            moe_req_to_token_pool=moe_req_to_token_pool,
++            moe_req_to_token_pool=moe_req_to_token_pool,
              token_to_kv_pool_allocator=token_to_kv_pool_allocator,
--            moe_token_to_kv_pool_allocator=moe_token_to_kv_pool_allocator,
++            moe_token_to_kv_pool_allocator=moe_token_to_kv_pool_allocator,
              tree_cache=tree_cache,
--            moe_tree_cache=moe_tree_cache,
++            moe_tree_cache=moe_tree_cache,
              is_hybrid_swa=is_hybrid_swa,
              model_config=model_config,
              enable_overlap=enable_overlap,
-@@ -1685,7 +1676,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -1677,7 +1686,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                  self.req_to_token_pool, self.token_to_kv_pool_allocator
              )
          # TODO (csy): for preempted requests, we may want to insert into the tree
--        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
-+        release_kv_cache(req, self.tree_cache, is_insert=False)
+-        release_kv_cache(req, self.tree_cache, is_insert=False)
++        # release_kv_cache(req, self.tree_cache, is_insert=False)
++        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
          # NOTE(lsyin): we should use the newly evictable memory instantly.
          num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
          evict_from_tree_cache(self.tree_cache, num_tokens)
 diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
-index 85cb043..d6d1172 100644
+index d6d1172..d7c10ed 100644
 --- a/python/sglang/srt/managers/schedule_policy.py
 +++ b/python/sglang/srt/managers/schedule_policy.py
-@@ -84,14 +84,12 @@ class SchedulePolicy:
+@@ -84,12 +84,14 @@ class SchedulePolicy:
          self,
          policy: str,
          tree_cache: BasePrefixCache,
--        moe_tree_cache : Optional[BasePrefixCache],        
++        moe_tree_cache: BasePrefixCache,
          enable_hierarchical_cache: bool,
          enable_priority_scheduling: bool,
          schedule_low_priority_values_first: bool,
      ):
          self.policy = self._validate_and_adjust_policy(policy, tree_cache)
          self.tree_cache = tree_cache
--        self.moe_tree_cache = moe_tree_cache
++        self.moe_tree_cache = moe_tree_cache
          self.enable_hierarchical_cache = enable_hierarchical_cache
          self.enable_priority_scheduling = enable_priority_scheduling
          self.schedule_low_priority_values_first = schedule_low_priority_values_first
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index a08d997..9e27cc8 100644
+index 9e27cc8..8fab2c1 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -35,7 +35,6 @@ from torch.cuda import Stream as CudaStream
- from torch.cuda import StreamContext as CudaStreamContext
- from torch.distributed import barrier
- 
--from sglang.srt.mem_cache.hiradix_cache import MoEHiRadixCache
- from sglang.srt.configs.model_config import ModelConfig
- from sglang.srt.constrained.base_grammar_backend import (
-     INVALID_GRAMMAR_OBJ,
-@@ -485,7 +484,6 @@ class Scheduler(
+@@ -484,6 +484,7 @@ class Scheduler(
          self.policy = SchedulePolicy(
              self.schedule_policy,
              self.tree_cache,
--            self.moe_tree_cache,
++            self.moe_tree_cache,
              self.enable_hierarchical_cache,
              self.enable_priority_scheduling,
              self.schedule_low_priority_values_first,
-@@ -713,7 +711,7 @@ class Scheduler(
+@@ -711,7 +712,7 @@ class Scheduler(
      def init_cache_with_memory_pool(self):
          server_args = self.server_args
  
--        self.req_to_token_pool, self.token_to_kv_pool_allocator, self.moe_req_to_token_pool, self.moe_token_to_kv_pool_allocator = (
-+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
++        self.req_to_token_pool, self.token_to_kv_pool_allocator, self.moe_req_to_token_pool, self.moe_token_to_kv_pool_allocator = (
              self.tp_worker.get_memory_pool()
          )
  
-@@ -815,30 +813,6 @@ class Scheduler(
+@@ -809,9 +810,31 @@ class Scheduler(
+                 )
+             )
+         )
+-
++        from sglang.srt.mem_cache.hiradix_cache import MoEHiRadixCache
          embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
          init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
++        moe_server_args = ServerArgs(
++            hicache_io_backend="kernel", 
++            hicache_mem_layout="page_first",
++            hicache_ratio=2,
++            hicache_size=60, 
++            hicache_storage_backend="mooncake",  
++            hicache_write_policy="write_through",
++            model_path=self.server_args.model_path
++        )
++
++        moe_params = CacheInitParams(
++            disable=False,
++            req_to_token_pool=self.moe_req_to_token_pool,
++            token_to_kv_pool_allocator=self.moe_token_to_kv_pool_allocator,
++            page_size=self.page_size,
++            tp_cache_group=(
++                self.attn_tp_cpu_group
++                if self.server_args.enable_dp_attention
++                else self.tp_cpu_group
++            ),
++        )
++        self.moe_tree_cache = MoEHiRadixCache(moe_params, moe_server_args)      
  
--
--        moe_server_args = ServerArgs(
--            hicache_io_backend="kernel", 
--            hicache_mem_layout="page_first",
--            hicache_ratio=2,
--            hicache_size=60, 
--            hicache_storage_backend="mooncake",  
--            hicache_write_policy="write_through",
--            model_path=self.server_args.model_path
--        )
--
--        moe_params = CacheInitParams(
--            disable=False,
--            req_to_token_pool=self.moe_req_to_token_pool,
--            token_to_kv_pool_allocator=self.moe_token_to_kv_pool_allocator,
--            page_size=self.page_size,
--            tp_cache_group=(
--                self.attn_tp_cpu_group
--                if self.server_args.enable_dp_attention
--                else self.tp_cpu_group
--            ),
--        )
--        self.moe_tree_cache = MoEHiRadixCache(moe_params, moe_server_args)        
--
      def init_disaggregation(self):
          self.disaggregation_mode = DisaggregationMode(
-             self.server_args.disaggregation_mode
-@@ -1672,7 +1646,6 @@ class Scheduler(
+@@ -1646,6 +1669,7 @@ class Scheduler(
              # only finished requests to running_batch.
              chunked_req_to_exclude.add(self.chunked_req)
              self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
--            self.moe_tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
++            self.moe_tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)            
              # chunked request keeps its rid but will get a new req_pool_idx
              if self.tp_worker.model_runner.mambaish_config is not None:
                  self.req_to_token_pool.free(
-@@ -1892,11 +1865,8 @@ class Scheduler(
+@@ -1865,8 +1889,11 @@ class Scheduler(
          new_batch = ScheduleBatch.init_new(
              can_run_list,
              self.req_to_token_pool,
--            self.moe_req_to_token_pool,
++            self.moe_req_to_token_pool,
              self.token_to_kv_pool_allocator,
--            self.moe_token_to_kv_pool_allocator,
++            self.moe_token_to_kv_pool_allocator,
              self.tree_cache,
--            self.moe_tree_cache,
++            self.moe_tree_cache,
              self.model_config,
              self.enable_overlap,
              self.spec_algorithm,
-@@ -2259,15 +2229,12 @@ class Scheduler(
+@@ -2229,12 +2256,15 @@ class Scheduler(
      def flush_cache(self):
          """Flush the memory pool and cache."""
          if self._is_no_request():
--            self.moe_tree_cache.wait_for_storage()
--            self.moe_tree_cache.reset()
++            self.moe_tree_cache.wait_for_storage()
++            self.moe_tree_cache.reset()            
              self.cur_batch = None
              self.last_batch = None
              self.tree_cache.reset()
              if self.grammar_backend:
                  self.grammar_backend.reset()
              self.req_to_token_pool.clear()
--            self.moe_req_to_token_pool.clear()
++            self.moe_req_to_token_pool.clear()
              self.token_to_kv_pool_allocator.clear()
  
              if self.draft_worker:
 diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-index 123e000..a9796c2 100644
+index a9796c2..d11f60b 100644
 --- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
 +++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-@@ -56,7 +56,7 @@ class SchedulerOutputProcessorMixin:
+@@ -56,7 +56,8 @@ class SchedulerOutputProcessorMixin:
                      req.rid,
                      thread_finish_flag=True,
                  )
--                release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
-+                release_kv_cache(req, self.tree_cache)
+-                release_kv_cache(req, self.tree_cache)
++                # release_kv_cache(req, self.tree_cache)
++                release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
  
          # Note: Logprobs should be handled on the prefill engine.
          trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
-@@ -121,12 +121,11 @@ class SchedulerOutputProcessorMixin:
+@@ -121,7 +122,8 @@ class SchedulerOutputProcessorMixin:
                              )
                          )
  
--                        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
-+                        release_kv_cache(req, self.tree_cache)
+-                        release_kv_cache(req, self.tree_cache)
++                        # release_kv_cache(req, self.tree_cache)
++                        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
                          req.time_stats.completion_time = time.perf_counter()
                      elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                          # This updates radix so others can match
-                         self.tree_cache.cache_unfinished_req(req)
--                        self.moe_tree_cache.cache_unfinished_req(req)
- 
-                     if batch.return_logprob:
-                         assert extend_logprob_start_len_per_req is not None
-@@ -251,10 +250,9 @@ class SchedulerOutputProcessorMixin:
+@@ -250,7 +252,8 @@ class SchedulerOutputProcessorMixin:
                      req.check_finished()
  
                      if req.finished():
--                        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
-+                        release_kv_cache(req, self.tree_cache)
+-                        release_kv_cache(req, self.tree_cache)
++                        # release_kv_cache(req, self.tree_cache)
++                        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
                      else:
                          self.tree_cache.cache_unfinished_req(req)
--                        self.moe_tree_cache.cache_unfinished_req(req)
                  else:
-                     # being chunked reqs' prefill is not finished
-                     req.is_chunked -= 1
-@@ -313,12 +311,11 @@ class SchedulerOutputProcessorMixin:
+@@ -311,7 +314,8 @@ class SchedulerOutputProcessorMixin:
              req.check_finished()
  
              if req.finished():
--                release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
-+                release_kv_cache(req, self.tree_cache)
+-                release_kv_cache(req, self.tree_cache)
++                # release_kv_cache(req, self.tree_cache)
++                release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
                  req.time_stats.completion_time = time.perf_counter()
                  break
  
-             self.tree_cache.cache_unfinished_req(req)
--            self.moe_tree_cache.cache_unfinished_req(req)
- 
-         self.stream_output(batch.reqs, batch.return_logprob)
-         self.token_to_kv_pool_allocator.free_group_end()
-@@ -383,9 +380,9 @@ class SchedulerOutputProcessorMixin:
+@@ -380,9 +384,11 @@ class SchedulerOutputProcessorMixin:
                  if self.server_args.disaggregation_decode_enable_offload_kvcache:
                      # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                      if not self.decode_offload_manager.offload_kv_cache(req):
--                        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
-+                        release_kv_cache(req, self.tree_cache)
+-                        release_kv_cache(req, self.tree_cache)
++                        # release_kv_cache(req, self.tree_cache)
++                        release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
                  else:
--                    release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
-+                    release_kv_cache(req, self.tree_cache)
+-                    release_kv_cache(req, self.tree_cache)
++                    # release_kv_cache(req, self.tree_cache)
++                    release_kv_cache(req, self.tree_cache, self.moe_tree_cache)
  
                  req.time_stats.completion_time = time.perf_counter()
  
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
-index 026f410..f37138a 100644
+index f37138a..56fd992 100644
 --- a/python/sglang/srt/managers/tp_worker.py
 +++ b/python/sglang/srt/managers/tp_worker.py
-@@ -97,8 +97,6 @@ class BaseTpWorker(ABC):
+@@ -97,6 +97,8 @@ class BaseTpWorker(ABC):
          return (
              self.model_runner.req_to_token_pool,
              self.model_runner.token_to_kv_pool_allocator,
--            self.model_runner.moe_req_to_token_pool,
--            self.model_runner.moe_token_to_kv_pool_allocator
++            self.model_runner.moe_req_to_token_pool,
++            self.model_runner.moe_token_to_kv_pool_allocator            
          )
  
      def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
 diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
-index b944163..48bbb36 100644
+index 48bbb36..bdc76d4 100644
 --- a/python/sglang/srt/mem_cache/common.py
 +++ b/python/sglang/srt/mem_cache/common.py
-@@ -385,19 +385,7 @@ def alloc_for_extend(
+@@ -385,7 +385,19 @@ def alloc_for_extend(
          prefix_tensors,
          batch.req_to_token_pool,
      )
--    write_cache_indices(  
--        out_cache_loc,
--        req_pool_indices_device,
--        req_pool_indices_cpu,
--        prefix_lens_device,
--        prefix_lens_cpu,
--        batch.seq_lens,
--        batch.seq_lens_cpu,
--        extend_lens_device,
--        extend_lens_cpu,
--        prefix_tensors,
--        batch.moe_req_to_token_pool,  
--    )      
-+
+-
++    write_cache_indices(  
++        out_cache_loc,
++        req_pool_indices_device,
++        req_pool_indices_cpu,
++        prefix_lens_device,
++        prefix_lens_cpu,
++        batch.seq_lens,
++        batch.seq_lens_cpu,
++        extend_lens_device,
++        extend_lens_cpu,
++        prefix_tensors,
++        batch.moe_req_to_token_pool,  
++    )      
      return out_cache_loc, req_pool_indices_device, req_pool_indices
  
  
-@@ -471,15 +459,12 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+@@ -459,12 +471,15 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
      batch.req_to_token_pool.write(
          (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
      )
--    batch.moe_req_to_token_pool.write(  
--        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
--    )
-+
+-
++    batch.moe_req_to_token_pool.write(  
++        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
++    )
      return out_cache_loc
  
  
--def release_kv_cache(req: Req, tree_cache: BasePrefixCache, moe_tree_cache: BasePrefixCache, is_insert: bool = True):
-+def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
++def release_kv_cache(req: Req, tree_cache: BasePrefixCache, moe_tree_cache: BasePrefixCache, is_insert: bool = True):
      tree_cache.cache_finished_req(req, is_insert=is_insert)
--    moe_tree_cache.cache_finished_req(req, is_insert=is_insert)    
++    moe_tree_cache.cache_finished_req(req, is_insert=is_insert)     
      start_p, end_p = req.pop_overallocated_kv_cache()
  
      global_server_args = get_global_server_args()
 diff --git a/python/sglang/srt/mem_cache/hiradix_cache.py b/python/sglang/srt/mem_cache/hiradix_cache.py
-index 189d520..1691fe3 100644
+index 1691fe3..4ebb44b 100644
 --- a/python/sglang/srt/mem_cache/hiradix_cache.py
 +++ b/python/sglang/srt/mem_cache/hiradix_cache.py
-@@ -944,65 +944,3 @@ class HiRadixCache(RadixCache):
+@@ -944,3 +944,64 @@ class HiRadixCache(RadixCache):
          del self.ongoing_prefetch[rid]
          self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
          self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
--
--class MoEHiRadixCache(HiRadixCache): 
--    def __init__(self, params, server_args):  
--        super().__init__(params, server_args)
--        
--    def cache_finished_req(self, req: Req, is_insert: bool = True):
--        token_ids = (req.origin_input_ids + req.output_ids)
--        kv_indices = self.req_to_token_pool.req_to_token[
--            req.req_pool_idx, : len(token_ids)
--        ]
--
--        values = kv_indices[: len(token_ids)].to(dtype=torch.int64, copy=True)
--        radix_key = RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle)
--
--        self.insert(radix_key, values, priority=0)
--        self.writing_check()
--        self.drain_storage_control_queues()
--
--    
--    def cache_unfinished_req(self, req: Req, chunked=False):
--        token_ids = req.fill_ids
--        kv_indices = self.req_to_token_pool.req_to_token[
--            req.req_pool_idx, : len(token_ids)
--        ]
--        values = kv_indices[: len(token_ids)].to(dtype=torch.int64, copy=True)
--        radix_key = RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle)
--        self.insert(
--            radix_key,
--            values,
--            chunked=chunked,
--            priority=0,
--        )
--        self.writing_check()
--        self.drain_storage_control_queues()
--
--
--    def wait_for_storage(self, timeout: Optional[float] = None) -> bool:    
--        start_time = time.monotonic()
--        while True:
--            self.writing_check()
--            self.drain_storage_control_queues()
--            
--            pending_operations = (
--                len(self.ongoing_backup) > 0 or
--                len(self.ongoing_write_through) > 0
--            )
--
--            if not pending_operations:
--                self.drain_storage_control_queues()
--                return True
--            
--            if timeout is not None and (time.monotonic() - start_time) > timeout:
--                remaining_backup = len(self.ongoing_backup)
--                remaining_write_through = len(self.ongoing_write_through)
--                logger.info(
--                    f"Storage wait timeout: {remaining_backup} backup, "
--                    f"{remaining_write_through} write-through operations pending"
--                )
--                return False
--            
--            time.sleep(0.001)  
--        
++
++class MoEHiRadixCache(HiRadixCache): 
++    def __init__(self, params, server_args):  
++        super().__init__(params, server_args)
++        
++    def cache_finished_req(self, req: Req, is_insert: bool = True):
++        token_ids = (req.origin_input_ids + req.output_ids)
++        kv_indices = self.req_to_token_pool.req_to_token[
++            req.req_pool_idx, : len(token_ids)
++        ]
++
++        values = kv_indices[: len(token_ids)].to(dtype=torch.int64, copy=True)
++        radix_key = RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle)
++
++        self.insert(radix_key, values, priority=0)
++        self.writing_check()
++        self.drain_storage_control_queues()
++
++    
++    def cache_unfinished_req(self, req: Req, chunked=False):
++        token_ids = req.fill_ids
++        kv_indices = self.req_to_token_pool.req_to_token[
++            req.req_pool_idx, : len(token_ids)
++        ]
++        values = kv_indices[: len(token_ids)].to(dtype=torch.int64, copy=True)
++        radix_key = RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle)
++        self.insert(
++            radix_key,
++            values,
++            chunked=chunked,
++            priority=0,
++        )
++        self.writing_check()
++        self.drain_storage_control_queues()
++
++
++    def wait_for_storage(self, timeout: Optional[float] = None) -> bool:    
++        start_time = time.monotonic()
++        while True:
++            self.writing_check()
++            self.drain_storage_control_queues()
++            
++            pending_operations = (
++                len(self.ongoing_backup) > 0 or
++                len(self.ongoing_write_through) > 0
++            )
++
++            if not pending_operations:
++                self.drain_storage_control_queues()
++                return True
++            
++            if timeout is not None and (time.monotonic() - start_time) > timeout:
++                remaining_backup = len(self.ongoing_backup)
++                remaining_write_through = len(self.ongoing_write_through)
++                logger.info(
++                    f"Storage wait timeout: {remaining_backup} backup, "
++                    f"{remaining_write_through} write-through operations pending"
++                )
++                return False
++            
++            time.sleep(0.001)  
+\ No newline at end of file
 diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
-index cff1e0e..7cefcfa 100644
+index 7cefcfa..7b803e4 100644
 --- a/python/sglang/srt/model_executor/cuda_graph_runner.py
 +++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
-@@ -619,7 +619,6 @@ class CudaGraphRunner:
+@@ -619,6 +619,7 @@ class CudaGraphRunner:
              orig_seq_lens=seq_lens,
              req_to_token_pool=self.model_runner.req_to_token_pool,
              token_to_kv_pool=self.model_runner.token_to_kv_pool,
--            moe_token_to_kv_pool=self.model_runner.moe_token_to_kv_pool,
++            moe_token_to_kv_pool=self.model_runner.moe_token_to_kv_pool,            
              attn_backend=attn_backend,
              out_cache_loc=out_cache_loc,
              seq_lens_sum=seq_lens.sum().item(),
 diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
-index 5409057..2859daf 100644
+index d2560e7..e342396 100644
 --- a/python/sglang/srt/model_executor/forward_batch_info.py
 +++ b/python/sglang/srt/model_executor/forward_batch_info.py
-@@ -311,9 +311,7 @@ class ForwardBatch:
+@@ -311,7 +311,9 @@ class ForwardBatch:
  
      # Attention backend
      req_to_token_pool: ReqToTokenPool = None
--    moe_req_to_token_pool: ReqToTokenPool = None  
++    moe_req_to_token_pool: ReqToTokenPool = None      
      token_to_kv_pool: KVCache = None
--    moe_token_to_kv_pool: Optional[KVCache] = None
++    moe_token_to_kv_pool: Optional[KVCache] = None    
      attn_backend: AttentionBackend = None
  
      # For DP attention
-@@ -393,9 +391,7 @@ class ForwardBatch:
+@@ -391,7 +393,9 @@ class ForwardBatch:
              lora_ids=batch.lora_ids,
              sampling_info=batch.sampling_info,
              req_to_token_pool=model_runner.req_to_token_pool,
--            moe_req_to_token_pool=model_runner.moe_req_to_token_pool,  
++            moe_req_to_token_pool=model_runner.moe_req_to_token_pool,              
              token_to_kv_pool=model_runner.token_to_kv_pool,
--            moe_token_to_kv_pool=model_runner.moe_token_to_kv_pool,
++            moe_token_to_kv_pool=model_runner.moe_token_to_kv_pool,            
              attn_backend=model_runner.attn_backend,
              spec_algorithm=batch.spec_algorithm,
              spec_info=batch.spec_info,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index bd4f475..8f50dc4 100644
+index 5965c48..6365fbb 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -2078,28 +2078,6 @@ class ModelRunner:
+@@ -2079,6 +2079,28 @@ class ModelRunner:
          else:
              assert self.is_draft_worker
  
--        self.moe_token_to_kv_pool = MLATokenToKVPool(  
--            size=self.max_total_num_tokens,  
--            page_size=1,  
--            dtype=torch.int32,  
--            kv_lora_rank=self.model_config.hf_config.num_experts_per_tok,
--            qk_rope_head_dim=0, 
--            layer_num=self.num_effective_layers,  
--            device=self.device,  
--            enable_memory_saver=False,  
--            start_layer=self.start_layer,  
--            end_layer=self.end_layer
--            )                      
--          
--        self.moe_token_to_kv_pool_allocator = TokenToKVPoolAllocator(  
--            size=self.max_total_num_tokens,  
--            dtype=torch.int32,  
--            device=self.device,  
--            kvcache=self.moe_token_to_kv_pool,  
--            need_sort=False,  
--        )            
--        self.moe_req_to_token_pool = self.req_to_token_pool
--
++        self.moe_token_to_kv_pool = MLATokenToKVPool(  
++            size=self.max_total_num_tokens,  
++            page_size=1,  
++            dtype=torch.int32,  
++            kv_lora_rank=self.model_config.hf_config.num_experts_per_tok,
++            qk_rope_head_dim=0, 
++            layer_num=self.num_effective_layers,  
++            device=self.device,  
++            enable_memory_saver=False,  
++            start_layer=self.start_layer,  
++            end_layer=self.end_layer
++            )                      
++          
++        self.moe_token_to_kv_pool_allocator = TokenToKVPoolAllocator(  
++            size=self.max_total_num_tokens,  
++            dtype=torch.int32,  
++            device=self.device,  
++            kvcache=self.moe_token_to_kv_pool,  
++            need_sort=False,  
++         )            
++        self.moe_req_to_token_pool = self.req_to_token_pool
++
          logger.info(
              f"Memory pool end. "
              f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index 47fac1a..f29dc4b 100644
+index 57625cd..653d992 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
-@@ -783,29 +783,21 @@ class DeepseekV2MoE(nn.Module):
+@@ -783,21 +783,29 @@ class DeepseekV2MoE(nn.Module):
                  and hidden_states.shape[0] > 0
                  and get_is_capture_mode()
              ):
--                final_hidden_states, topk_output = self.forward_normal_dual_stream(
-+                return self.forward_normal_dual_stream(
+-                return self.forward_normal_dual_stream(
++                final_hidden_states, topk_output = self.forward_normal_dual_stream(
                      hidden_states,
                      should_allreduce_fusion,
                      use_reduce_scatter,
                      gemm_output_zero_allocator,
                  )
              else:
--                final_hidden_states, topk_output = self.forward_normal(
-+                return self.forward_normal(
+-                return self.forward_normal(
++                final_hidden_states, topk_output = self.forward_normal(
                      hidden_states,
                      should_allreduce_fusion,
                      use_reduce_scatter,
                      gemm_output_zero_allocator,
                  )
          else:
--            final_hidden_states, topk_output = self.forward_deepep(hidden_states, forward_batch)
--
--        forward_batch.moe_token_to_kv_pool.set_kv_buffer(    
--            layer=self,    
--            loc=forward_batch.out_cache_loc,    
--            cache_k=topk_output.topk_ids.unsqueeze(1),   
--            cache_v=None,   
--        )  
--        return final_hidden_states      
-+            return self.forward_deepep(hidden_states, forward_batch)
+-            return self.forward_deepep(hidden_states, forward_batch)
++            final_hidden_states, topk_output = self.forward_deepep(hidden_states, forward_batch)
++
++        forward_batch.moe_token_to_kv_pool.set_kv_buffer(    
++            layer=self,    
++            loc=forward_batch.out_cache_loc,    
++            cache_k=topk_output.topk_ids.unsqueeze(1),   
++            cache_v=None,   
++        )  
++        return final_hidden_states      
  
      def forward_normal_dual_stream(
          self,
-@@ -838,7 +830,7 @@ class DeepseekV2MoE(nn.Module):
+@@ -830,7 +838,7 @@ class DeepseekV2MoE(nn.Module):
              and not should_use_flashinfer_cutlass_moe_fp4_allgather()
          ):
              final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
--        return final_hidden_states, topk_output
-+        return final_hidden_states
+-        return final_hidden_states
++        return final_hidden_states, topk_output
  
      def forward_normal(
          self,
-@@ -916,7 +908,7 @@ class DeepseekV2MoE(nn.Module):
+@@ -908,7 +916,7 @@ class DeepseekV2MoE(nn.Module):
              and not should_use_flashinfer_cutlass_moe_fp4_allgather()
          ):
              final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
--        return final_hidden_states, topk_output
-+        return final_hidden_states
+-        return final_hidden_states
++        return final_hidden_states, topk_output
  
      def forward_cpu(
          self,
-@@ -1124,7 +1116,7 @@ class DeepseekV2MoE(nn.Module):
-             if not self.experts.should_fuse_routed_scaling_factor_in_topk:
-                 final_hidden_states *= self.routed_scaling_factor
+@@ -966,7 +974,7 @@ class DeepseekV2MoE(nn.Module):
+         )
+         if self.tp_size > 1 and not should_allreduce_fusion:
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+-        return final_hidden_states
++        return final_hidden_states, topk_output
  
--        return final_hidden_states, topk_output
-+        return final_hidden_states
- 
-     def _forward_shared_experts(
-         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
+     def forward_deepep(
+         self,
+-- 
+2.43.0
+
