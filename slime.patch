@@ -1,6 +1,6 @@
-From 21957ca7eb5243834fbb5df6c52514f063c0e651 Mon Sep 17 00:00:00 2001
+From 22d3c8b811bb56f49d9efe698508ad7838f1ee68 Mon Sep 17 00:00:00 2001
 From: xywang <1003212437@qq.com>
-Date: Mon, 29 Dec 2025 16:11:23 +0800
+Date: Tue, 30 Dec 2025 16:45:20 +0800
 Subject: [PATCH] Changes to be committed: 	modified:   .gitignore 	new
  file:   data/test.jsonl 	new file:   scripts/run-moonlight.sh 
  modified:   slime/backends/megatron_utils/actor.py 	modified:  
@@ -10,12 +10,12 @@ Subject: [PATCH] Changes to be committed: 	modified:   .gitignore 	new
 ---
  .gitignore                                   |   3 +-
  data/test.jsonl                              |  10 +
- scripts/run-moonlight.sh                     | 224 +++++++++++++++++++
+ scripts/run-moonlight.sh                     | 205 +++++++++++++++++++
  slime/backends/megatron_utils/actor.py       |   5 +-
- slime/backends/sglang_utils/sglang_engine.py |   2 +-
+ slime/backends/sglang_utils/sglang_engine.py |   3 +-
  slime/utils/data.py                          |   2 +-
- slime/utils/routing_replay.py                | 166 +++++++++++++-
- 7 files changed, 402 insertions(+), 10 deletions(-)
+ slime/utils/routing_replay.py                | 162 ++++++++++++++-
+ 7 files changed, 381 insertions(+), 9 deletions(-)
  create mode 100644 data/test.jsonl
  create mode 100755 scripts/run-moonlight.sh
 
@@ -50,10 +50,10 @@ index 00000000..9dbe2f7c
 +{"data_source":"math_dapo","prompt":[{"content":"Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\nSuppose you have a sphere tangent to the $xy$-plane with its center having a positive $z$-coordinate. If it is projected from a point $P=(0,b,a)$ to the $xy$-plane, it gives the conic section $y=x^2$. If we write $a=\\frac{p}{q}$ where $p$ and $q$ are integers, find $p+q$.\n\nRemember to put your answer on its own line after \"Answer:\".","role":"user"}],"ability":"MATH","reward_model":{"ground_truth":"3","style":"rule-lighteval\/MATH_v2"},"extra_info":{"index":"e4eede97-5bed-4a2a-9b64-5de4e8cde3e8"}}
 diff --git a/scripts/run-moonlight.sh b/scripts/run-moonlight.sh
 new file mode 100755
-index 00000000..6c5d30f4
+index 00000000..008ee8f4
 --- /dev/null
 +++ b/scripts/run-moonlight.sh
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,205 @@
 +#!/bin/bash
 +
 +# for rerun the task
@@ -72,16 +72,10 @@ index 00000000..6c5d30f4
 +set -ex
 +
 +# will prevent ray from buffering stdout/stderr
-+export PYTHONBUFFERED=0
-+# export CUDNN_LOGERR_DBG=1
-+
-+export MOONCAKE_MASTER="localhost:50051"
-+export MOONCAKE_PROTOCOL="rdma"
-+export MOONCAKE_DEVICE="mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_8,mlx5_9,mlx5_10"  # 只使用可用设备
-+  
++export PYTHONBUFFERED=0  
 +# export GLOG_v=3  # 更详细的日志级别
 +
-+LOG_FILE="./mooncake_$(date +'%Y%m%d_%H%M%S').log" && mooncake_master  --rpc_thread_num=256  --default_kv_lease_ttl=300000  -eviction_high_watermark_ratio=0.6 &> "$LOG_FILE" &
++LOG_FILE="./mooncake_$(date +'%Y%m%d_%H%M%S').log" && mooncake_master  --rpc_thread_num=256  --default_kv_lease_ttl=300000  --eviction_high_watermark_ratio=0.6 &> "$LOG_FILE" &
 +
 +NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 +if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -114,15 +108,14 @@ index 00000000..6c5d30f4
 +   # --rollout-shuffle
 +   --rm-type deepscaler
 +   --num-rollout 400
-+   --rollout-batch-size 100
++   --rollout-batch-size 1000
 +   --n-samples-per-prompt 1
 +   --rollout-max-response-len 7800
 +   --rollout-temperature 0.8
 +   --use-rollout-routing-replay 
 +   # --use-slime-router
-+   --over-sampling-batch-size 200
++   --over-sampling-batch-size 1000
 +   # --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
-+
 +   --num-steps-per-rollout 1
 +   # --balance-data
 +)
@@ -138,15 +131,14 @@ index 00000000..6c5d30f4
 +PERF_ARGS=(
 +   --tensor-model-parallel-size 1
 +   # --sequence-parallel
-+   --pipeline-model-parallel-size 8
-+   --context-parallel-size 1
++   --pipeline-model-parallel-size 4
++   --context-parallel-size 4
 +   --expert-model-parallel-size 1
 +   --expert-tensor-parallel-size 1
 +   --decoder-last-pipeline-num-layers 6
-+   --recompute-granularity full
-+   --recompute-method uniform
-+   --recompute-num-layers 1
-+
++   # --recompute-granularity full
++   # --recompute-method uniform
++   # --recompute-num-layers 1
 +   # --use-dynamic-batch-size
 +   # --max-tokens-per-gpu 16384
 +)
@@ -183,20 +175,19 @@ index 00000000..6c5d30f4
 +TENSOR_BOARD_ARGS=(
 +   --use-tensorboard 
 +   --tb-project-name R3 
-+   --tb-experiment-name R3_fast_$(date +'%Y%m%d_%H%M%S')
++   --tb-experiment-name R3_official_$(date +'%Y%m%d_%H%M%S')
 +)
 +
 +SGLANG_ARGS=(
-+   --rollout-num-gpus-per-engine 8
-+   --sglang-mem-fraction-static 0.8
-+
++   --rollout-num-gpus-per-engine 16
++   --sglang-mem-fraction-static 0.2
 +   # dp attention
 +   # --sglang-enable-dp-attention
 +   # --sglang-enable-tokenizer-batch-encode 
 +   # --sglang-disable-cuda-graph
 +   --sglang-dp-size 1
-+   --sglang-tp-size 8
-+   --sglang-ep-size 1
++   --sglang-tp-size 16
++   --sglang-ep-size 16
 +   # --sglang-moe-dense-tp-size 1
 +   # --sglang-enable-dp-lm-head
 +   # --sglang-disable-radix-cache
@@ -204,14 +195,11 @@ index 00000000..6c5d30f4
 +   # --sglang-log-requests
 +   # --sglang-moe-a2a-backend deepep
 +   # --sglang-enable-nan-detection
-+
-+
 +   # enable deepep for sglang
 +   # --sglang-enable-deepep-moe
 +   # --sglang-deepep-mode auto
-+
 +   # make every dp rank has 128 concurrency
-+   --sglang-server-concurrency 128
++   --sglang-server-concurrency 1000
 +)
 +
 +MISC_ARGS=(
@@ -224,8 +212,6 @@ index 00000000..6c5d30f4
 +   # need to comment this when using model with MLA
 +   --attention-backend flash
 +   # --debug-rollout-only
-+
-+
 +   # use deepep for megatron
 +   # --moe-enable-deepep
 +   # --moe-token-dispatcher-type flex
@@ -234,51 +220,45 @@ index 00000000..6c5d30f4
 +)
 +
 +# launch the master node of ray in container
-+export no_proxy="127.0.0.1,${GEMINI_HOST_IP_taskrole1_0}"
++MASTER_ADDR="$(hostname -I | awk '{print $1}')"
++export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 +ray start --head \
-+    --node-ip-address "127.0.0.1" \
-+    --num-gpus 8 \
-+    --disable-usage-stats \
-+    --dashboard-host=0.0.0.0 \
-+    --dashboard-port=8265
-+# if [ "$GEMINI_CURRENT_TASK_ROLE_CURRENT_TASK_INDEX" -eq 0 ]; then
-+#     ray start --head \
-+#         --node-ip-address "${GEMINI_HOST_IP_taskrole1_0}" \
-+#         --num-gpus 8 \
-+#         --disable-usage-stats \
-+#         --dashboard-host=0.0.0.0 \
-+#         --dashboard-port=8265
-+# else
-+#     ray start --address "${GEMINI_HOST_IP_taskrole1_0}:6379" --num-gpus 8 --disable-usage-stats
-+# fi
-+# if [ "$GEMINI_CURRENT_TASK_ROLE_CURRENT_TASK_INDEX" -eq 0 ]; then
++          --node-ip-address ${MASTER_ADDR} \
++          --num-gpus 8 \
++          --disable-usage-stats \
++          --dashboard-host=0.0.0.0 \
++          --dashboard-port=8265
++
++RUNTIME_ENV_JSON="{
++  \"env_vars\": {
++    \"no_proxy\": \"localhost,127.0.0.1,0.0.0.0,${MASTER_ADDR}\",
++    \"MASTER_ADDR\": \"${MASTER_ADDR}\",  
++    \"PYTHONPATH\": \"/root/Megatron-LM/\",
++    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
++    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
++    \"MOONCAKE_MASTER\": \"${MASTER_ADDR}:50051\",
++    \"MOONCAKE_DEVICE\": \"mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_8,mlx5_9,mlx5_10\",
++    \"MOONCAKE_PROTOCOL\": \"rdma\"
++  }
++}"
++
 +ray job submit --address="http://127.0.0.1:8265" \
-+   --runtime-env-json='{
-+   "env_vars": {
-+      "no_proxy": "localhost,127.0.0.1,0.0.0.0",
-+      "MASTER_ADDR": "127.0.0.1",
-+      "PYTHONPATH": "/root/Megatron-LM/",
-+      "LD_LIBRARY_PATH": "/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/sgl-workspace/nvshmem/install/lib/"
-+   }
-+   }' \
++   --runtime-env-json="${RUNTIME_ENV_JSON}" \
 +   -- python3 train.py \
-+   --actor-num-nodes 1 \
++   --actor-num-nodes 2 \
 +   --actor-num-gpus-per-node 8 \
 +   --colocate \
++   ${TENSOR_BOARD_ARGS[@]} \
 +   ${MODEL_ARGS[@]} \
 +   ${CKPT_ARGS[@]} \
 +   ${ROLLOUT_ARGS[@]} \
 +   ${OPTIMIZER_ARGS[@]} \
 +   ${GRPO_ARGS[@]} \
-+   ${DISTRIBUTED_ARGS[@]} \
 +   ${WANDB_ARGS[@]} \
 +   ${PERF_ARGS[@]} \
 +   ${EVAL_ARGS[@]} \
 +   ${SGLANG_ARGS[@]} \
-+   ${MISC_ARGS[@]} \
-+   ${TENSOR_BOARD_ARGS[@]}
-+# fi
-\ No newline at end of file
++   ${MISC_ARGS[@]}
 diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
 index f7efc480..986e1c3d 100644
 --- a/slime/backends/megatron_utils/actor.py
@@ -303,15 +283,23 @@ index f7efc480..986e1c3d 100644
  
      def _switch_model(self, target_tag: str) -> None:
 diff --git a/slime/backends/sglang_utils/sglang_engine.py b/slime/backends/sglang_utils/sglang_engine.py
-index 57fa5270..108f2570 100644
+index 57fa5270..eefe542b 100644
 --- a/slime/backends/sglang_utils/sglang_engine.py
 +++ b/slime/backends/sglang_utils/sglang_engine.py
-@@ -458,7 +458,7 @@ def _compute_server_args(
+@@ -444,6 +444,7 @@ def _compute_server_args(
+         "ep_size": args.sglang_ep_size,
+         # always skip warmup to prevent warmup timeout.
+         "skip_server_warmup": True,
++        "enable_return_routed_experts": False
+     }
+ 
+     if worker_type == "prefill":
+@@ -457,8 +458,6 @@ def _compute_server_args(
+         kwargs["disaggregation_mode"] = "decode"
          kwargs["prefill_round_robin_balance"] = True
  
-     if args.use_rollout_routing_replay:
+-    if args.use_rollout_routing_replay:
 -        kwargs["enable_return_routed_experts"] = True
-+        kwargs["enable_return_routed_experts"] = False
      if args.fp16:
          kwargs["dtype"] = "float16"
      external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
@@ -329,7 +317,7 @@ index 45ee103f..6fe23c2b 100644
                  )
              )
 diff --git a/slime/utils/routing_replay.py b/slime/utils/routing_replay.py
-index 86472816..65832acd 100644
+index 86472816..c6d9b645 100644
 --- a/slime/utils/routing_replay.py
 +++ b/slime/utils/routing_replay.py
 @@ -1,9 +1,17 @@
@@ -355,12 +343,12 @@ index 86472816..65832acd 100644
  
  class RoutingReplay:
      all_routing_replays = []
-+    _store = None  # 类级别单例
++    _store = None
 +    _host_kv_cache = None
  
      def __init__(self):
          self.forward_index = 0
-@@ -53,10 +63,160 @@ class RoutingReplay:
+@@ -53,6 +63,156 @@ class RoutingReplay:
          for replay in RoutingReplay.all_routing_replays:
              replay.clear_forward()
  
@@ -517,20 +505,6 @@ index 86472816..65832acd 100644
  
  def get_routing_replay_compute_topk(old_compute_topk):
      def compute_topk(scores, topk, num_groups=None, group_topk=None):
--        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
-+        if os.environ.get("ENABLE_ROUTING_REPLAY", "1") == "1":
-             routing_replay_stage = os.environ["ROUTING_REPLAY_STAGE"]
-             if routing_replay_stage == "fallthrough":
-                 return old_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
-@@ -83,7 +243,7 @@ def get_routing_replay_compute_topk(old_compute_topk):
- 
- 
- def register_routing_replay(module):
--    if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
-+    if os.environ.get("ENABLE_ROUTING_REPLAY", "1") == "1":
-         module.routing_replay = RoutingReplay()
- 
-         def pre_forward_hook(*args, **kwargs):
 -- 
 2.43.0
 

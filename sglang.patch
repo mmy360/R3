@@ -1,6 +1,6 @@
-From e80554785defbc2a2786e59199160ee338e62c55 Mon Sep 17 00:00:00 2001
+From fac6599a7033530c440118980e61d204c1538dba Mon Sep 17 00:00:00 2001
 From: xywang <1003212437@qq.com>
-Date: Mon, 29 Dec 2025 14:11:13 +0800
+Date: Tue, 30 Dec 2025 17:01:19 +0800
 Subject: [PATCH] Changes to be committed: 	modified:  
  python/sglang/srt/managers/schedule_batch.py 	modified:  
  python/sglang/srt/managers/schedule_policy.py 	modified:  
@@ -9,24 +9,26 @@ Subject: [PATCH] Changes to be committed: 	modified:
  modified:   python/sglang/srt/managers/tp_worker.py 	modified:  
  python/sglang/srt/mem_cache/common.py 	modified:  
  python/sglang/srt/mem_cache/hiradix_cache.py 	modified:  
- python/sglang/srt/model_executor/cuda_graph_runner.py 	modified:  
- python/sglang/srt/model_executor/forward_batch_info.py 	modified:  
- python/sglang/srt/model_executor/model_runner.py 	modified:  
+ python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py 
+ modified:   python/sglang/srt/model_executor/cuda_graph_runner.py 
+ modified:   python/sglang/srt/model_executor/forward_batch_info.py 
+ modified:   python/sglang/srt/model_executor/model_runner.py 	modified:  
  python/sglang/srt/models/deepseek_v2.py
 
 ---
- python/sglang/srt/managers/schedule_batch.py  | 16 ++++-
+ python/sglang/srt/managers/schedule_batch.py  | 16 +++-
  python/sglang/srt/managers/schedule_policy.py |  2 +
- python/sglang/srt/managers/scheduler.py       | 34 ++++++++++-
- .../scheduler_output_processor_mixin.py       | 18 ++++--
+ python/sglang/srt/managers/scheduler.py       | 34 ++++++-
+ .../scheduler_output_processor_mixin.py       | 18 ++--
  python/sglang/srt/managers/tp_worker.py       |  2 +
- python/sglang/srt/mem_cache/common.py         | 21 ++++++-
- python/sglang/srt/mem_cache/hiradix_cache.py  | 61 +++++++++++++++++++
+ python/sglang/srt/mem_cache/common.py         | 21 ++++-
+ python/sglang/srt/mem_cache/hiradix_cache.py  | 61 +++++++++++++
+ .../storage/mooncake_store/mooncake_store.py  | 88 ++++++-------------
  .../srt/model_executor/cuda_graph_runner.py   |  1 +
- .../srt/model_executor/forward_batch_info.py  |  4 ++
- .../sglang/srt/model_executor/model_runner.py | 22 +++++++
- python/sglang/srt/models/deepseek_v2.py       | 20 ++++--
- 11 files changed, 181 insertions(+), 20 deletions(-)
+ .../srt/model_executor/forward_batch_info.py  |  4 +
+ .../sglang/srt/model_executor/model_runner.py | 22 +++++
+ python/sglang/srt/models/deepseek_v2.py       | 19 ++--
+ 12 files changed, 209 insertions(+), 79 deletions(-)
 
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
 index 3650ba8..7d3d0d9 100644
@@ -389,6 +391,137 @@ index 1691fe3..4ebb44b 100644
 +            
 +            time.sleep(0.001)  
 \ No newline at end of file
+diff --git a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+index f610122..91fd1bf 100644
+--- a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
++++ b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+@@ -109,9 +109,9 @@ class MooncakeStoreConfig:
+             local_hostname = os.getenv(
+                 "LOCAL_HOSTNAME", envs.MOONCAKE_LOCAL_HOSTNAME.default
+             )
+-
++        import ray
+         return MooncakeStoreConfig(
+-            local_hostname=local_hostname,
++            local_hostname=ray.util.get_node_ip_address(),
+             metadata_server=envs.MOONCAKE_TE_META_DATA_SERVER.value,
+             global_segment_size=_parse_global_segment_size(
+                 envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.value
+@@ -123,36 +123,6 @@ class MooncakeStoreConfig:
+             check_server=envs.MOONCAKE_CHECK_SERVER.value,
+         )
+ 
+-    @staticmethod
+-    def load_from_extra_config(extra_config: dict) -> "MooncakeStoreConfig":
+-        """Load config from extra_config dictionary."""
+-        if "master_server_address" not in extra_config:
+-            raise ValueError("master_server_address is required in extra_config")
+-
+-        return MooncakeStoreConfig(
+-            local_hostname=extra_config.get(
+-                "local_hostname", envs.MOONCAKE_LOCAL_HOSTNAME.default
+-            ),
+-            metadata_server=extra_config.get(
+-                "metadata_server", envs.MOONCAKE_TE_META_DATA_SERVER.default
+-            ),
+-            global_segment_size=_parse_global_segment_size(
+-                extra_config.get(
+-                    "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
+-                )
+-            ),
+-            protocol=extra_config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
+-            device_name=extra_config.get("device_name", envs.MOONCAKE_DEVICE.default),
+-            master_server_address=extra_config["master_server_address"],
+-            master_metrics_port=extra_config.get(
+-                "master_metrics_port", envs.MOONCAKE_MASTER_METRICS_PORT.default
+-            ),
+-            check_server=extra_config.get(
+-                "check_server", envs.MOONCAKE_CHECK_SERVER.default
+-            ),
+-        )
+-
+-
+ class MooncakeStore(HiCacheStorage):
+ 
+     def __init__(self, storage_config: HiCacheStorageConfig = None):
+@@ -168,29 +138,29 @@ class MooncakeStore(HiCacheStorage):
+         try:
+             self.store = MooncakeDistributedStore()
+ 
+-            extra_config = (
+-                getattr(storage_config, "extra_config", None)
+-                if storage_config
+-                else None
+-            )
++            # extra_config = (
++            #     getattr(storage_config, "extra_config", None)
++            #     if storage_config
++            #     else None
++            # )
+             # Load configuration with master_server_address prioritized from extra_config if available
+-            if (
+-                extra_config is not None
+-                and extra_config.get("master_server_address") is not None
+-            ):
++            # if (
++                # extra_config is not None
++                # and extra_config.get("master_server_address") is not None
++            # ):
+                 # Load from extra_config
+-                self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
+-                logger.info(
+-                    "Mooncake Configuration loaded from extra_config successfully."
+-                )
+-            elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
+-                # Load from config file
+-                self.config = MooncakeStoreConfig.from_file()
+-                logger.info("Mooncake Configuration loaded from file successfully.")
+-            else:
++                # self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
++                # logger.info(
++                    # "Mooncake Configuration loaded from extra_config successfully."
++                # )
++            # elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
++            #     # Load from config file
++            #     self.config = MooncakeStoreConfig.from_file()
++            #     logger.info("Mooncake Configuration loaded from file successfully.")
++            # else:
+                 # Load from environment variables
+-                self.config = MooncakeStoreConfig.load_from_env()
+-                logger.info("Mooncake Configuration loaded from env successfully.")
++            self.config = MooncakeStoreConfig.load_from_env()
++            logger.info("Mooncake Configuration loaded from env successfully.")
+ 
+             tp_scale_factor = 1 if storage_config is None else storage_config.tp_size
+ 
+@@ -199,10 +169,10 @@ class MooncakeStore(HiCacheStorage):
+             )
+ 
+             # Check if extra_backend_tag should be passed to MooncakeDistributedStore
+-            self.extra_backend_tag = None
+-            if extra_config and "extra_backend_tag" in extra_config:
+-                self.extra_backend_tag = extra_config["extra_backend_tag"]
+-                logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
++            # self.extra_backend_tag = None
++            # if extra_config and "extra_backend_tag" in extra_config:
++            #     self.extra_backend_tag = extra_config["extra_backend_tag"]
++            #     logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
+ 
+             # Check server status
+             if self.config.check_server:
+@@ -390,9 +360,9 @@ class MooncakeStore(HiCacheStorage):
+         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+     ) -> List[bool]:
+         # Apply extra_backend_tag prefix if available
+-        if self.extra_backend_tag is not None:
+-            prefix = self.extra_backend_tag
+-            keys = [f"{prefix}_{key}" for key in keys]
++        # if self.extra_backend_tag is not None:
++        #     prefix = self.extra_backend_tag
++        #     keys = [f"{prefix}_{key}" for key in keys]
+ 
+         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+         exist_result = self._batch_exist(key_strs)
 diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
 index 7cefcfa..7b803e4 100644
 --- a/python/sglang/srt/model_executor/cuda_graph_runner.py
@@ -459,10 +592,10 @@ index 5965c48..6365fbb 100644
              f"Memory pool end. "
              f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index 57625cd..653d992 100644
+index 57625cd..168dadc 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
-@@ -783,21 +783,29 @@ class DeepseekV2MoE(nn.Module):
+@@ -783,21 +783,28 @@ class DeepseekV2MoE(nn.Module):
                  and hidden_states.shape[0] > 0
                  and get_is_capture_mode()
              ):
@@ -484,7 +617,6 @@ index 57625cd..653d992 100644
          else:
 -            return self.forward_deepep(hidden_states, forward_batch)
 +            final_hidden_states, topk_output = self.forward_deepep(hidden_states, forward_batch)
-+
 +        forward_batch.moe_token_to_kv_pool.set_kv_buffer(    
 +            layer=self,    
 +            loc=forward_batch.out_cache_loc,    
@@ -495,7 +627,7 @@ index 57625cd..653d992 100644
  
      def forward_normal_dual_stream(
          self,
-@@ -830,7 +838,7 @@ class DeepseekV2MoE(nn.Module):
+@@ -830,7 +837,7 @@ class DeepseekV2MoE(nn.Module):
              and not should_use_flashinfer_cutlass_moe_fp4_allgather()
          ):
              final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -504,7 +636,7 @@ index 57625cd..653d992 100644
  
      def forward_normal(
          self,
-@@ -908,7 +916,7 @@ class DeepseekV2MoE(nn.Module):
+@@ -908,7 +915,7 @@ class DeepseekV2MoE(nn.Module):
              and not should_use_flashinfer_cutlass_moe_fp4_allgather()
          ):
              final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -513,7 +645,7 @@ index 57625cd..653d992 100644
  
      def forward_cpu(
          self,
-@@ -966,7 +974,7 @@ class DeepseekV2MoE(nn.Module):
+@@ -966,7 +973,7 @@ class DeepseekV2MoE(nn.Module):
          )
          if self.tp_size > 1 and not should_allreduce_fusion:
              final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
