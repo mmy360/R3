@@ -1,7 +1,7 @@
 From 22d3c8b811bb56f49d9efe698508ad7838f1ee68 Mon Sep 17 00:00:00 2001
 From: xywang <1003212437@qq.com>
 Date: Tue, 30 Dec 2025 16:45:20 +0800
-Subject: [PATCH] Changes to be committed: 	modified:   .gitignore 	new
+Subject: [PATCH 1/2] Changes to be committed: 	modified:   .gitignore 	new
  file:   data/test.jsonl 	new file:   scripts/run-moonlight.sh 
  modified:   slime/backends/megatron_utils/actor.py 	modified:  
  slime/backends/sglang_utils/sglang_engine.py 	modified:  
@@ -505,6 +505,102 @@ index 86472816..c6d9b645 100644
  
  def get_routing_replay_compute_topk(old_compute_topk):
      def compute_topk(scores, topk, num_groups=None, group_topk=None):
+-- 
+2.43.0
+
+
+From 44de2a9524afe4eafb340e9bd6452bd05f4a46c3 Mon Sep 17 00:00:00 2001
+From: xywang <1003212437@qq.com>
+Date: Fri, 2 Jan 2026 13:47:22 +0800
+Subject: [PATCH 2/2] Changes to be committed: 	modified:  
+ scripts/run-moonlight.sh 	modified:   slime/utils/routing_replay.py
+
+---
+ scripts/run-moonlight.sh      | 14 ++++++++------
+ slime/utils/routing_replay.py | 10 +++-------
+ 2 files changed, 11 insertions(+), 13 deletions(-)
+
+diff --git a/scripts/run-moonlight.sh b/scripts/run-moonlight.sh
+index 008ee8f4..803b4368 100755
+--- a/scripts/run-moonlight.sh
++++ b/scripts/run-moonlight.sh
+@@ -6,10 +6,12 @@ pkill -9 mooncake
+ sleep 3
+ ray stop --force
+ pkill -9 ray
++pkill -9 sglang
+ pkill -9 python
+ pkill -9 mooncake
+ sleep 3
+ pkill -9 ray
++pkill -9 sglang
+ pkill -9 python
+ pkill -9 mooncake
+ 
+@@ -52,13 +54,13 @@ ROLLOUT_ARGS=(
+    # --rollout-shuffle
+    --rm-type deepscaler
+    --num-rollout 400
+-   --rollout-batch-size 1000
++   --rollout-batch-size 8000
+    --n-samples-per-prompt 1
+    --rollout-max-response-len 7800
+    --rollout-temperature 0.8
+    --use-rollout-routing-replay 
+    # --use-slime-router
+-   --over-sampling-batch-size 1000
++   --over-sampling-batch-size 8000
+    # --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+    --num-steps-per-rollout 1
+    # --balance-data
+@@ -123,15 +125,15 @@ TENSOR_BOARD_ARGS=(
+ )
+ 
+ SGLANG_ARGS=(
+-   --rollout-num-gpus-per-engine 16
+-   --sglang-mem-fraction-static 0.2
++   --rollout-num-gpus-per-engine 8
++   --sglang-mem-fraction-static 0.6
+    # dp attention
+    # --sglang-enable-dp-attention
+    # --sglang-enable-tokenizer-batch-encode 
+    # --sglang-disable-cuda-graph
+    --sglang-dp-size 1
+-   --sglang-tp-size 16
+-   --sglang-ep-size 16
++   --sglang-tp-size 8
++   --sglang-ep-size 8
+    # --sglang-moe-dense-tp-size 1
+    # --sglang-enable-dp-lm-head
+    # --sglang-disable-radix-cache
+diff --git a/slime/utils/routing_replay.py b/slime/utils/routing_replay.py
+index c6d9b645..40eaa62d 100644
+--- a/slime/utils/routing_replay.py
++++ b/slime/utils/routing_replay.py
+@@ -65,11 +65,7 @@ class RoutingReplay:
+ 
+     @classmethod
+     def _ensure_store_initialized(cls):
+-        if cls._store is None:
+-            import os
+-            os.environ["MOONCAKE_MASTER"] = "localhost:50051"
+-            os.environ["MOONCAKE_PROTOCOL"] = "rdma"
+-            
++        if cls._store is None:            
+             cls._store = MooncakeStore(
+                 HiCacheStorageConfig(
+                     tp_size=1, tp_rank=0, is_mla_model=True,
+@@ -91,8 +87,8 @@ class RoutingReplay:
+             
+             cls._host_kv_cache = MLATokenToKVPoolHost(
+                 device_pool=LightweightMHAPool(),
+-                host_to_device_ratio=2.0,
+-                host_size=1, page_size=1,
++                host_to_device_ratio=8.0,
++                host_size=12, page_size=1,
+                 layout="page_first",
+                 pin_memory=False,
+                 device="cpu"
 -- 
 2.43.0
 
